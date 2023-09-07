@@ -1,5 +1,5 @@
 ---
-title: "BC2 Spatial Transcriptomics Workshop"
+title: "BC2 Spatial Transcriptomics Tutorial"
 output: 
   html_document:
     dev: png
@@ -7,6 +7,7 @@ output:
     toc_depth: 3
     toc_float: 
       collapsed: false
+bibliography: citations.bib 
 date: '`r format(Sys.Date(), "%d %B, %Y")`'
 author: Estella Yixing Dong
 ---
@@ -78,14 +79,14 @@ ggdraw() +
 ### Various image registration methods
 There are many ways of image registration in R, Python, with other plug-ins. 
 
-* `SpatialData` is a Python package that requires user-selected landmarks to align images. Here shows the registration of Visium onto Xenium in `SpatialData`'s napari interface.
+* `SpatialData` is a Python package that requires user-selected landmarks to align images. Here shows the registration of Visium onto Xenium in `SpatialData`'s napari interface [@marconato2023spatialdata].
 ```{r, fig.width=6, echo=FALSE, fig.align='center'}
 knitr::include_graphics(here::here("www/Vis_to_Xe_SpaData.png"), error = FALSE)
 ```
 
 <br>
 
-* R packages `RNiftyReg` can be combined with `mmand` for automated image registration. After alignment, we will obtain the registered images with a transformation matrix. Here is a demonstration with external data, before and after registration of two slices. 
+* R packages `RNiftyReg` can be combined with `mmand` for automated image registration. After alignment, we will obtain the registered images with a transformation matrix. Here is a demonstration with external data, before and after registration of two slices [@rnifty2015jcladen]. 
 ```{r, echo=FALSE, fig.width=5, fig.align='center'}
 knitr::include_graphics(here::here("www/RNiftyReg1.png"), error = FALSE)
 ```
@@ -421,3 +422,4 @@ On the left is aggregated Xenium, and on the right is Visium. We see high concor
 
 From here on, you can identify the markers in each cluster, and do differential expression analysis between clusters, by the method of your choice (e.g. Seurat, CSIDE, etc.)
 
+# References

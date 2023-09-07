@@ -1,5 +1,5 @@
 ---
-title: "BC2 Spatial Transcriptomics Workshop"
+title: "BC2 Spatial Transcriptomics Tutorial"
 output: 
   html_document:
     toc: true

@@ -1,5 +1,5 @@
 ---
-title: "BC2 Spatial Transcriptomics Workshop"
+title: "BC2 Spatial Transcriptomics Tutorial"
 output: 
   html_document:
     toc: true
@@ -116,16 +116,16 @@ dim(vis) # 18019  4988
 ```
 
 ## Visium normalization
-Normalization wtih SCTransform, as recommended by Seurat framework. 
+Normalization with SCTransform, as recommended by Seurat framework. 
 ```{r, eval = FALSE}
 # vis <- readRDS("./intermediate_data/vis_qcd.rds")
 vis <- SCTransform(vis, assay = "Spatial", verbose = FALSE)
 ```
 
-## Visium dimension reduction and clusetering
+## Visium dimension reduction and clustering
 Dimensionality reduction and clustering with Seurat.
 ```{r, message=FALSE, warning=FALSE, eval = FALSE}
-vis <- FindVariableFeatures(vis, selection.method = "vst", nfeatures = 3000)
+# vis <- FindVariableFeatures(vis, selection.method = "vst", nfeatures = 3000)
 vis <- RunPCA(vis, npcs = 50, assay = "SCT", verbose = FALSE)
 vis <- RunUMAP(vis, reduction = "pca", dims = 1:50)
 vis <- FindNeighbors(vis, reduction = "pca", dims = 1:50)
@@ -207,7 +207,7 @@ vis_sce <- SingleCellExperiment(assays = list(counts = vis_mat,
 ```
 
 
-We assign the same number of clusters to BayesSpace identified by Seurat (n.cluster = 18), since we also get the confirmation of a similar number of cluster from Chromium (n.cluster = 19).  This step takes a long time to run, so it's recommended to run on HPC, and save the results. 
+We assign the same number of clusters to BayesSpace identified by Seurat (n.cluster = 18), since we also get the confirmation of a similar number of cluster from Chromium (n.cluster = 19, see `Chromium.Rmd` and the `Visium deconvolution` section in this Markdown).  This step takes a long time to run, so it's recommended to run on HPC, and save the results. 
 ```{r, eval = FALSE, message=FALSE}
 # Just FYI, there is also a speed-up version of the original Bioconductor R package BayesSpace from GitHub, for the enhanced resolution of BayesSpace (which we won't cover in this tutorial)
 # devtools::install_github(senbaikang/BayesSpace)
@@ -238,7 +238,7 @@ p3 <- DimPlot(vis, group.by = "spatial.cluster") + ggtitle("Colored by BayesSpac
 p4 <- SpatialDimPlot(vis, group.by = "spatial.cluster", label = TRUE, label.size = 3)
 p3 + p4
 ```
-We can see that BayesSpace recovers the structure of DCIS (cluster 1) better compares to Seurat clustering, which does not take into account the spatial coordinate information.  
+We can see that BayesSpace recovers the structure of DCIS 2 (cluster 1) better compared to Seurat clustering, which does not take into account the spatial coordinate information.  
 
 From here on, you can perform differential expression analysis between the clusters. 
 
