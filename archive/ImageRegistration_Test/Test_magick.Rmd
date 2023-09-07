@@ -1,0 +1,48 @@
+---
+title: "Test_magick"
+output: html_document
+date: "2023-09-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# here::i_am("Xenium_data/intermediate_data/scripts/transcripts.Rmd")
+root_path <- "~/Desktop/raw_data_must/"
+# save_path <- "~/Desktop/intermediate_data/"
+suppressMessages({
+  library(here)
+  library(Seurat)
+  library(BayesSpace)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tibble)
+  library(scater)
+  library(scuttle)
+  library(grid)
+  library(hrbrthemes)
+  library(gridExtra)
+  library(RColorBrewer)
+  library(SingleR)
+  library(mclust)
+  library(magick)
+  library(png)
+  library(mmand)
+})
+
+vis_path <- paste0(root_path, "Visium/outs/")
+xe_path <- paste0(root_path, "Xenium/outs/")
+```
+
+## Visium
+```{r, message=FALSE}
+img_vis <- magick::image_read(paste0(vis_path, "spatial/tissue_lowres_image.png"))
+magick::image_scale(img_vis, "x600")
+```
+
+## Xenium
+```{r, message=FALSE}
+img_xe <- magick::image_read(paste0(xe_path, "../Xenium_ome_tif.png"))
+magick::image_scale(magick::image_rotate(img_xe, 90), "x400")
+
+```

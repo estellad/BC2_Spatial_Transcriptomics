@@ -1,0 +1,423 @@
+---
+title: "BC2 Spatial Transcriptomics Workshop"
+output: 
+  html_document:
+    dev: png
+    toc: true
+    toc_depth: 3
+    toc_float: 
+      collapsed: false
+date: '`r format(Sys.Date(), "%d %B, %Y")`'
+author: Estella Yixing Dong
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+
+```{r lib, warning=FALSE}
+root_path <- "~/Desktop/raw_data_must/"
+chrom_path <- paste0(root_path, "Chromium/")
+vis_path <- paste0(root_path, "Visium/outs/")
+xe_path <- paste0(root_path, "Xenium/outs/")
+aggxe_path <- paste0(root_path, "AggXe/outs/")
+
+suppressMessages({
+  library(Seurat)
+  library(BayesSpace)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tibble)
+  library(scater)
+  library(scran)
+  library(scuttle)
+  library(grid)
+  library(hrbrthemes)
+  library(gridExtra)
+  library(SingleR)
+  library(magick)
+  library(harmony)
+  library(scales)
+  library(knitr)
+  library(here)
+  library(cowplot)
+})
+
+source("utils_new.R")
+```
+
+# Xenium Integration with Visium
+## Image Alignment
+### Visualize and rotate Visium and Xenium
+First, we check the similarity between Visium and Xenium images. Visium comes with a H&E image. 
+
+Then we visualize the Xenium image. It can be obtained by taking a screenshot of the .ome.tif object in Xenium raw data, which was read in using a Java software Fiji. Note that after some scaling and rotation, Xenium can be aligned to Visium. In image processing, such transformation can be done by multiplying the source image with a linear affine transformation matrix, to map it onto the same scale as the target image. 
+```{r, echo = FALSE}
+## Visium Image
+# # img_vis <- magick::image_read(paste0(vis_path, "spatial/tissue_lowres_image.png"))
+
+## Xenium Image
+# img_xe <- magick::image_read(paste0(xe_path, "../Xenium_ome_tif.png"))
+# img_xe <- magick::image_read("www/Xenium_ome_tif.png") # Read a copy from the current directory for knitting RMarkdown
+# img_xe_rotate_scale <- magick::image_scale(magick::image_rotate(img_xe, 90), "x400")
+# magick::image_write(img_xe_rotate_scale, "www/img_xe_rotate_scale.png", format = "png")
+```
+
+```{r, fig.show='hold', message=FALSE}
+ggdraw() + 
+  draw_image("www/tissue_lowres_image.png", width = 0.55) + 
+  draw_label ("Visium H&E", hjust = 0, vjust = 0, x = 0, y = 0.95) + 
+  draw_image("www/img_xe_rotate_scale.png", width = 0.25, x = 0.7) + 
+  draw_label ("Xenium .ome.tif (rotate & shrink)", hjust = 0, vjust = 0, x = 0.6, y = 0.95)
+```
+
+
+### Various image registration methods
+There are many ways of image registration in R, Python, with other plug-ins. 
+
+* `SpatialData` is a Python package that requires user-selected landmarks to align images. Here shows the registration of Visium onto Xenium in `SpatialData`'s napari interface.
+```{r, fig.width=6, echo=FALSE, fig.align='center'}
+knitr::include_graphics(here::here("www/Vis_to_Xe_SpaData.png"), error = FALSE)
+```
+
+<br>
+
+* R packages `RNiftyReg` can be combined with `mmand` for automated image registration. After alignment, we will obtain the registered images with a transformation matrix. Here is a demonstration with external data, before and after registration of two slices. 
+```{r, echo=FALSE, fig.width=5, fig.align='center'}
+knitr::include_graphics(here::here("www/RNiftyReg1.png"), error = FALSE)
+```
+ 
+```{r, out.width="40%", echo=FALSE, fig.align='center'}
+knitr::include_graphics(here::here("www/RNiftyReg2.png"), error = FALSE)
+```
+
+|            However, the automation does not work well on images with very different orientation, scale, and intensity,
+|            such as in this use-case of Xenium and Visium.  
+
+<br>
+
+* Therefore, we use the transformation matrix provided by 10x, which was done by registration with Python and a Java plug-in Fiji. The following matrix is the result of registering Xenium onto Visium.
+  ```{r, message=FALSE, eval=FALSE}
+  # Affine matrix aligned by 10X
+  trans_mtx <- matrix(
+    c(
+      8.82797498e-02, -1.91831377e+00,  1.63476055e+04,
+      1.84141210e+00,  5.96797885e-02,  4.12499099e+03,
+      -3.95225478e-07, -4.66405945e-06,  1.03706895e+00
+    ),
+    nrow = 3, byrow= TRUE
+  )
+  trans_mtx
+  ```
+
+## Aggregate Xenium into circles as Visium
+We have developed a Bioconductor R package for binning any single-cell resolution spatial data into spots, which can be useful in checking correlations between technical replicates of the same technology, identify artifacts across technologies, and checking cell density (number of cells per spot). The user can choose to bin from transcript-level (sub-cellular) or cell-level. Our package `bin2spot` will soon be available to the public after some optimization with the speed in the backend. 
+```{r}
+# aggxe <- bin2spot::aggregate_xenium(xe, scaling_factor)
+```
+
+For this tutorial, we have saved the output of the binned Xenium object, aggregated by our lab member. 
+
+Here is the result of post affine transformation and aggregation, the aligment of Xenium onto Visium. 
+```{r, fig.width=5, echo=FALSE, fig.align='center'}
+knitr::include_graphics(here::here("www/Xe_to_Vis_10x.png"), error = FALSE)
+```
+
+
+## Read aggregated Xenium as Visium object
+After aggregation, we can read in aggregated Xenium with the Seurat function for reading Visium. Visualize aggregated Xenium with H&E image.
+```{r}
+aggxe_path <- paste0(root_path, "AggXe/outs/")
+# xe_path <- "~/Desktop/PhDWork/1st_year_BC2_Conf/intermediate_data/Visium/outs/"
+aggxe <- Load10X_Spatial(aggxe_path)
+SpatialFeaturePlot(aggxe, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Aggregated Xenium")
+# saveRDS(aggxe, "./intermediate_data/aggxe_raw.rds")
+```
+
+## Aggregated Xenium QC
+### Per-spot QC
+QC aggregated Xenium. we follow the same rule for Visium. 
+```{r, warning=FALSE, fig.width=8, fig.height=5}
+aggxe <- readRDS("./intermediate_data/aggxe_raw.rds")
+# Prepare mitochondria percentage 
+aggxe$percent.mt <- PercentageFeatureSet(aggxe, pattern = "^MT-")
+VlnPlot(aggxe, features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"), pt.size = 0.1)
+```
+
+There are no mitochondria genes in Xenium. We apply the same threshold of Visium to aggregated Xenium, and set the threshold at 100 for total library size and feature detected per spot.  
+```{r}
+head(sort(aggxe$nCount_Spatial), 20)
+table(isOutlier(aggxe$nCount_Spatial, type = "lower"))
+```
+
+```{r}
+head(sort(aggxe$nFeature_Spatial), 20)
+table(isOutlier(aggxe$nFeature_Spatial, type = "lower"))
+```
+
+Most of the low count spots are at the border, so it is reasonable to remove. 
+```{r, fig.width=5, fig.height=4, message=FALSE}
+aggxe$low_count_spots <- aggxe$nCount_Spatial < 100 | aggxe$nFeature_Spatial < 100
+plotQCSpatial_seu(aggxe, flag = "low_count_spots") + coord_flip() + scale_x_reverse()
+```
+
+### Per-gene QC
+Derive low abundance genes, and there is no low abundance genes in aggregated Xenium.
+```{r}
+aggxe_lowgenecount_drop <- rowSums(GetAssayData(aggxe, "counts") > 0) < 20
+table(aggxe_lowgenecount_drop)
+```
+
+### Post QC subsetting
+Eliminate genes and spots did not pass QC:
+```{r}
+aggxe <- aggxe[!aggxe_lowgenecount_drop,  # low abundance genes
+               !aggxe$low_count_spots ]     # low library size & number of detected genes per spot
+
+dim(aggxe) # 313 3931
+# saveRDS(aggxe, "./intermediate_data/aggxe_qcd.rds")
+```
+
+We put Visium and aggregated Xenium side by side
+```{r, message=FALSE, fig.width=8, fig.height=4}
+vis <- readRDS("./intermediate_data/vis_qcd.rds")
+aggxe <- readRDS("./intermediate_data/aggxe_qcd.rds")
+p1 <- SpatialFeaturePlot(vis, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Visium")
+p2 <- SpatialFeaturePlot(aggxe, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Aggregated Xenium")
+
+p1 + p2
+```
+
+Subset both Visium and Xenium to common spots 
+```{r}
+aggxe <- readRDS("./intermediate_data/aggxe_qcd.rds")
+vis <- readRDS("./intermediate_data/vis_qcd.rds")
+
+common_spots <- intersect(colnames(aggxe), colnames(vis)) # 3928
+common_genes <- intersect(rownames(aggxe), rownames(vis)) # 306
+
+vis <- vis[rownames(vis) %in% common_genes, colnames(vis) %in% common_spots]
+aggxe <- aggxe[rownames(aggxe) %in% common_genes, colnames(aggxe) %in% common_spots]
+
+dim(vis) # 18019 4988 -> 306 3928
+dim(aggxe) # 313 3931 -> 306 3928
+
+# saveRDS(vis, "./intermediate_data/integr_vis_sub.rds")
+# saveRDS(aggxe, "./intermediate_data/integr_aggxe_sub.rds")
+```
+
+Now we should see Visium and aggregated Xenium on the same range
+```{r, message=FALSE, fig.width=8, fig.height=4}
+vis <- readRDS("./intermediate_data/integr_vis_sub.rds")
+aggxe <- readRDS("./intermediate_data/integr_aggxe_sub.rds")
+
+p1 <- SpatialFeaturePlot(vis, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Visium")
+p2 <- SpatialFeaturePlot(aggxe, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Aggregated Xenium")
+
+p1 + p2
+```
+
+
+## Joint clustering of Visium and Xenium with BayesSpace
+### Conversion to `SingleCellExperiment` class
+Convert Visium and Aggregated Xenium Seurat object to SCE. Here we follow the the same idea of what we have done for Visium previously.
+```{r, message=FALSE}
+vis <- readRDS("./intermediate_data/integr_vis_sub.rds")
+
+# Obtain the count matrix from Seurat object. 
+vis_mat <- vis@assays$Spatial@counts
+
+# Merge in spatial coordinates from original tissue_position.csv.
+vis_coord <- read.csv(paste0(vis_path, "spatial/tissue_positions_list.csv"), header = FALSE)
+colnames(vis_coord) <- c("barcodes", "in_tissue", "row", "col", "pxl_row_in_fullres", "pxl_col_in_fullres")
+
+vis_meta <- vis@meta.data
+vis_meta$barcodes <- rownames(vis_meta)
+
+vis_CD <- vis_meta %>%
+  left_join(vis_coord)
+
+vis_sce <- SingleCellExperiment(assays = list(counts = vis_mat), 
+                                colData = vis_CD)
+vis_sce$orig.ident <- "Visium"
+
+# saveRDS(vis_sce, "./intermediate_data/integr_vis_sub_sce.rds")
+```
+
+We do the same conversion for aggregated Xenium. 
+```{r, message=FALSE}
+vis_sce <- readRDS("./intermediate_data/integr_vis_sub_sce.rds")
+aggxe <- readRDS("./intermediate_data/integr_aggxe_sub.rds")
+# Obtain the count matrix from Seurat object. 
+aggxe_mat <- aggxe@assays$Spatial@counts
+
+# Here we also need to make sure the genes and spot barcodes between count matrix of Visium and aggregated Xenium are ordered the same.
+aggxe_mat <- aggxe_mat[rownames(vis_sce), colnames(vis_sce)]
+
+# Merge in spatial coordinates from original tissue_position.csv. Make sure the barcode order matches Visium.
+aggxe_coord <- read.csv(paste0(aggxe_path, "spatial/tissue_positions_list.csv"), header = FALSE)
+colnames(aggxe_coord) <- c("barcodes", "in_tissue", "row", "col", "pxl_row_in_fullres", "pxl_col_in_fullres")
+rownames(aggxe_coord) <- aggxe_coord$barcodes
+aggxe_coord <- aggxe_coord[colnames(vis_sce), ]
+
+# Make sure the barcode order matches Visium.
+aggxe_meta <- aggxe@meta.data
+aggxe_meta$barcodes <- rownames(aggxe_meta)
+aggxe_meta <- aggxe_meta[colnames(vis_sce), ]
+
+aggxe_CD <- aggxe_meta %>%
+  left_join(aggxe_coord)
+
+aggxe_sce <- SingleCellExperiment(assays = list(counts = aggxe_mat), 
+                                  colData = aggxe_CD)
+aggxe_sce$orig.ident <- "AggregatedXenium"
+
+# saveRDS(aggxe_sce, "./intermediate_data/integr_aggxe_sub_sce.rds")
+```
+
+Save the combined object
+```{r}
+vis_sce <- readRDS("./intermediate_data/integr_vis_sub_sce.rds")
+aggxe_sce <- readRDS("./intermediate_data/integr_aggxe_sub_sce.rds")
+
+vis_aggxe_sce <- cbind(vis_sce, aggxe_sce)
+# saveRDS(vis_aggxe_sce, "./intermediate_data/integr_vis_aggxe_sce.rds")
+```
+
+### Normalization and dimension reduction
+Preprocess the data with log normalization and 50 PCs, using BayesSpace build-in function `spatialPreprocess()`. Since there are only 306 common genes between Visium and Xenium, we use all of them for the identification of HVGs. 
+```{r}
+vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce.rds")
+set.seed(123)
+vis_aggxe_sce <- spatialPreprocess(vis_aggxe_sce, n.PCs = 50, n.HVGs = nrow(vis_aggxe_sce)) #lognormalize, PCA
+```
+
+Check batch effect between Visium and aggregated Xenium. 
+```{r, fig.width=6, fig.height=4}
+set.seed(123)
+vis_aggxe_sce = runUMAP(vis_aggxe_sce, dimred = "PCA")
+colnames(reducedDim(vis_aggxe_sce, "UMAP")) = c("UMAP1", "UMAP2")
+
+ggplot(data.frame(reducedDim(vis_aggxe_sce, "UMAP")), 
+       aes(x = UMAP1, y = UMAP2, color = factor(vis_aggxe_sce$orig.ident))) +
+  geom_point() +
+  labs(color = "Sample") +
+  theme_bw() + ggtitle("Batch effect between Visium and aggregated Xenium")
+```
+
+### Batch correction with Harmony
+There is a noticeable batch effect. We use Harmony to integrate the two samples.
+```{r, fig.width=6, fig.height=4}
+# install.packages("devtools")
+# devtools::install_github("immunogenomics/harmony")
+set.seed(123)
+vis_aggxe_sce = RunHarmony(vis_aggxe_sce, "orig.ident", verbose = F)
+vis_aggxe_sce = runUMAP(vis_aggxe_sce, dimred = "HARMONY", name = "UMAP.HARMONY")
+colnames(reducedDim(vis_aggxe_sce, "UMAP.HARMONY")) = c("UMAP1", "UMAP2")
+
+ggplot(data.frame(reducedDim(vis_aggxe_sce, "UMAP.HARMONY")), 
+       aes(x = UMAP1, y = UMAP2, color = factor(vis_aggxe_sce$orig.ident))) +
+  geom_point() +
+  labs(color = "Sample") +
+  theme_bw() + ggtitle("UMAP after batch correction")
+
+# saveRDS(vis_aggxe_sce, "./intermediate_data/integr_vis_aggxe_sce_batch_corrected.rds")
+```
+
+### Adding offset
+Batch effect are corrected! Now we can continue with joint spatial clustering with BayesSpace. However, since BayesSpace takes the information of spatial coordinates, we should misalign the coordinates of the two samples, by adding an offset term. The two samples should have no overlap spatially. 
+```{r, fig.width=6, fig.height=4}
+vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce_batch_corrected.rds")
+# range(vis_aggxe_sce$row) # 0 77
+# range(vis_aggxe_sce$col) # 0 103
+
+# Keep Visium unmoved, but shift the coordinates of aggregated Xenium to the right. 
+vis_aggxe_sce$col[vis_aggxe_sce$orig.ident == "AggregatedXenium"] <- 
+  vis_aggxe_sce$col[vis_aggxe_sce$orig.ident == "AggregatedXenium"] + 120
+
+# Use BayesSpace's build-in function to make sure there is no overlap in the coordinates.
+clusterPlot(vis_aggxe_sce, "orig.ident", color = NA) +
+  labs(fill = "Sample", title = "Offset check") + scale_x_reverse()
+  
+# saveRDS(vis_aggxe_sce, "./intermediate_data/integr_vis_aggxe_sce_batch_corrected_offset.rds")
+```
+
+### Visualize highly variable genes
+We can first visualize some highly variable genes (HVGs). The following HVGs are identified in the step of `BayesSpace::spatialPreprocess()` and stored in the `rowData(sce)` of the SCE object. We can see that, out of 306 genes, 167 are considered highly variable. 
+```{r}
+vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce_batch_corrected_offset.rds")
+table(rowData(vis_aggxe_sce)$is.HVG)
+```
+
+We pick the top 6 HVGs to visualize based on their significance of variability. 
+```{r}
+set.seed(123)
+dec <- scran::modelGeneVar(vis_aggxe_sce, assay.type = "logcounts")
+vis_aggxe_HVGs <- dec %>%
+  as.data.frame() %>%
+  arrange(p.value) %>%
+  head()
+vis_aggxe_HVGs$gene_name <- rownames(vis_aggxe_HVGs)
+vis_aggxe_HVGs
+```
+
+Visualize top 6 HVGs on batch corrected UMAP. 
+```{r, fig.width=16, fig.height=6.5, message=FALSE}
+# plot the log normalized value on UMAP
+vis_aggxe_sce <- logNormCounts(vis_aggxe_sce)
+
+markers <- vis_aggxe_HVGs$gene_name
+feat.umap.plots <- purrr::map(markers, function(x) plotFeatureUMAP(vis_aggxe_sce, x, facet = "orig.ident"))
+patchwork::wrap_plots(feat.umap.plots, ncol=3)
+
+```
+
+Visualize the log normalized expression value of the selected HVGs spatially, in the combined offsetted Visium and aggregated Xenium object. 
+```{r, fig.width=16, fig.height=6.5}
+markers <- vis_aggxe_HVGs$gene_name
+feat.spa.plots <- purrr::map(markers, 
+                         function(x) BayesSpace::featurePlot(vis_aggxe_sce, x, high = "blue") + 
+                           scale_x_reverse())
+patchwork::wrap_plots(feat.spa.plots, ncol=3)
+```
+
+Interestingly, gene ACTG2 (marker for breast myoepithelial cells and smooth muscle cells) has very different expression pattern in aggregated Xenium compared to Visium. This is likely due to some technical artifacts, and there should exist some computational methods to correct for such contamination. 
+
+
+### BayesSpace joint spatial clustering
+Joint clustering of combined object of Visium and aggregated Xenium.
+```{r, eval=FALSE}
+vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce_batch_corrected_offset.rds")
+
+# DO NOT RUN - TAKING TOO LONG
+vis_aggxe_sce <- vis_aggxe_sce %>% 
+        spatialCluster(q=18, use.dimred = "HARMONY", platform="Visium", nrep = 10000)
+
+# saveRDS(vis_aggxe_sce, "./intermediate_data/integr_vis_aggxe_sce_batch_corrected_offset_bayesspace.rds")
+```
+
+Visualize the result of joint spatial clustering by BayesSpace. First in batch corrected UMAP space. 
+
+```{r, fig.width=9, fig.height=5}
+vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce_batch_corrected_offset_bayesspace.rds")
+
+plotClusterUMAP(vis_aggxe_sce, cluster_name = "spatial.cluster", facet = "orig.ident")
+```
+
+Then we check the join spatial clusters in the tissue. 
+```{r, fig.width=10, fig.width=9}
+vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce_batch_corrected_offset_bayesspace.rds")
+
+clusterPlot(vis_aggxe_sce, "spatial.cluster", color = NA, size = 0.1) +
+  labs(fill = "Spatial Cluster", title = "Joint spatial clustering ") + scale_x_reverse()
+
+```
+
+On the left is aggregated Xenium, and on the right is Visium. We see high concordnace between the two modalities. Additionally, aggregated Xenium returns higher granularity in general. 
+
+
+From here on, you can identify the markers in each cluster, and do differential expression analysis between clusters, by the method of your choice (e.g. Seurat, CSIDE, etc.)
+

@@ -1,0 +1,782 @@
+---
+title: "BC2_Tutorial"
+output: html_document
+date: "2023-08-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+```{r lib, warning=FALSE}
+root_path <- "~/Desktop/raw_data_must/"
+chrom_path <- paste0(root_path, "Chromium/")
+vis_path <- paste0(root_path, "Visium/outs/")
+xe_path <- paste0(root_path, "Xenium/outs/")
+aggxe_path <- paste0(root_path, "AggXe/outs/")
+
+suppressMessages({
+  library(here)
+  library(Seurat)
+  library(BayesSpace)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tibble)
+  library(scater)
+  library(scuttle)
+  library(grid)
+  library(hrbrthemes)
+  library(gridExtra)
+  library(RColorBrewer)
+  library(SingleR)
+  library(mclust)
+  library(magick)
+  library(harmony)
+})
+
+source("utils_new.R")
+```
+
+
+# Chromium analysis 
+
+Read in Chromium as Seurat object, and we store its annotation in the metadata. The Chromium annotation is derived by 10x using marker genes and cell atlas reference. Since a round of QC on cells was done by 10x before annotating the Chromium, we avoid repetitive QC on cells. 
+Cell barcodes that are in count matrix but not in the annotation file is QCed out. 
+```{r, results = "hide", message=FALSE}
+chrom_path <- paste0(root_path, "Chromium/")
+Counts <- Seurat::Read10X_h5(paste0(chrom_path, "filtered_feature_bc_matrix.h5")) 
+# dim(Counts)                       # 18082 30365  gene * cells barcodes
+
+Anno <- read.csv(paste0(chrom_path, "chrom_cell_annotations.csv")) 
+rownames(Anno) <- Anno$Barcode 
+# dim(Anno)                         # 27472 cell barcodes
+
+overlap_cell_barcode <- intersect(colnames(Counts), rownames(Anno)) 
+# length(overlap_cell_barcode)      # 27460 cell barcodes that passed QC by 10x
+
+# Create flag discard for cells that are QCed out
+Anno_ <- data.frame(Barcode = colnames(Counts)) %>%
+  left_join(Anno) %>%
+  mutate(Annotation = ifelse(is.na(Annotation), "discard", Annotation))
+rownames(Anno_) <- Anno_$Barcode
+
+chrom <- CreateSeuratObject(counts = Counts, meta.data = Anno_) 
+# dim(chrom)                        # 18082 30365
+
+saveRDS(chrom, "./intermediate_data/chrom_raw.rds")
+rm(Counts, Anno_, Anno); gc()
+```
+
+The reason of discard could be low library size or high mitochondria percentage. Here we visualize the discarded cells on the histogram of library size and mitochondria percentage, both on log scale. 
+```{r, warning=FALSE, fig.width=10, fig.height=4}
+chrom <- readRDS("./intermediate_data/chrom_raw.rds")
+
+# Add per cell QC metrics
+chrom$percent.mt <- PercentageFeatureSet(chrom, pattern = "^MT-")
+chrom$discard <- ifelse(chrom$Annotation == "discard", TRUE, FALSE)
+
+p1 <- plot_Hist_Low_Lib_Sizes(chrom, yvar = "discard")
+p2 <- plot_Hist_High_Mito_Props(chrom, yvar = "discard")
+
+(p1 + p2) + plot_annotation("Chromium QC - Per Cell")
+```
+
+For QC on genes, we exclude low abundance genes with mean expression level lower than exp(-5) \approx 0.0067. 
+```{r, warning=FALSE, fig.width=5, fig.height=4}
+# Add per gene QC metrics
+chrom <- addQCMetricsPerGene_seu(chrom)
+chrom_lowgenecount_drop <- unlist(chrom[["RNA"]][["lowgenecount_drop"]])
+
+if(any(chrom_lowgenecount_drop)){
+  p3 <- plot_Hist_Low_Abun_Genes(chrom)
+}
+
+p3 + plot_annotation("Chromium QC - Per Gene")
+```
+
+For the sake of time, we could directly load in the saved raw Chromium data in the next chunk. We now subset to cells that have successfully past QC, and save the Chromium reference that is ready for cell-type deconvolution with RCTD. 
+```{r}
+# Subset
+chrom <- chrom[!chrom_lowgenecount_drop, !chrom$discard]
+
+dim(chrom) # 13969 27460
+saveRDS(chrom, "./intermediate_data/chrom_qcd.rds")
+
+## Ready for RCTD :D
+```
+
+Now the QCed Chromium data is ready for constructing RCTD reference object in the following section. We first visualize available cell-type proportion in the Chromium dataset.
+```{r, fig.width=6, fig.height=4}
+plotBar_seu(chrom, decreasing = TRUE, title = "Cell-type Frequency in Annotated Chromium")
+```
+Now we proceed to the analysis of Visium and also preparing for the spatial object required for cell-type deconvolution. 
+
+# Visium analysis
+
+Read in Visium Seurat object, and spatially visualize the per spot total count
+```{r}
+vis_path <- paste0(root_path, "Visium/outs/")
+
+vis <- Load10X_Spatial(vis_path)
+Idents(vis) <- ""
+SpatialFeaturePlot(vis, features = "nCount_Spatial") + theme(legend.position = "right")
+
+# saveRDS(vis, "./intermediate_data/vis_raw.rds")
+```
+
+QC Visium with the guidance from OSTA book. Library size (`sum` in OSTA book, `nCount_Spatial` in Seurat), number of features detected (`detected` in OSTA book, `nFeature_Spatial` in Seurat), mitochondria percentage, and number of cells per spot need to be checked. However, in this breast cancer data, no ground truth of number of cells per spot is given like in the Human DLPFC data in `spatialLIBD`. Therefore, we skip the last criteria, and focusing on the first three.  
+
+Investigate the proper cut-off threshold. Note that Visium is not at single cell resolution, so the automated QC functionality developed for single-cell RNA-seq, such as `scuttle::isOutlier()`, should be carefully double-checked to prevent falsely removal of spots in spatial data. 
+
+Here we have a quick view of the distribution of the three variables of interest. We want to eliminate spots with low total library size, and low number of features detected per spot, and high mitochondria.
+```{r}
+vis <- readRDS("./intermediate_data/vis_raw.rds")
+# Prepare mitochondria percentage 
+vis$percent.mt <- PercentageFeatureSet(vis, pattern = "^MT-")
+VlnPlot(vis, features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"), pt.size = 0.1)
+```
+
+Check the lower end of `nCount_Spatial`, and set the threshold at 100 to visualize the effect of QC in `plotQCSpatial_seu()`. However, note that the removal is not necessary. 
+```{r}
+head(sort(vis$nCount_Spatial), 20)
+table(isOutlier(vis$nCount_Spatial, type = "lower"))
+```
+
+Check the lower end of `nFeature_Spatial`, and set the threshold also at 100.
+```{r}
+head(sort(vis$nFeature_Spatial), 20)
+table(isOutlier(vis$nFeature_Spatial, type = "lower"))
+```
+Check the higher end of `percent.mt`, and no spot has unusually high mitochondria percentage. 
+```{r}
+tail(sort(vis$percent.mt), 20)
+```
+
+Plot QC result. The helper function here is inspired by the Bioconductor function ggspavis::plotQC(spe), and here `plotQCSpatial_seu()` takes a Seurat object with "Spatial" assay and has spatial coordinates stored in its metadata. 
+```{r}
+vis$low_count_spots <- vis$nCount_Spatial < 100 | vis$nFeature_Spatial < 100
+plotQCSpatial_seu(vis, flag = "low_count_spots")
+```
+Deriving low abundance gene flag. For genes, we require it to be detected in at least 20 spots. 66 genes will be removed. 
+```{r}
+vis_lowgenecount_drop <- rowSums(GetAssayData(vis, "counts") > 0) < 20
+table(vis_lowgenecount_drop)
+```
+
+Eliminate genes and spots did not pass QC:
+```{r}
+vis <- vis[!vis_lowgenecount_drop,  # low abundance genes
+             !vis$low_count_spots ]     # low library size & number of detected genes per spot
+
+dim(vis) # 18019  4988
+saveRDS(vis, "./intermediate_data/vis_qcd.rds")
+```
+
+Normalization wtih SCTransform
+```{r}
+# vis <- readRDS("./intermediate_data/vis_qcd.rds")
+vis <- SCTransform(vis, assay = "Spatial", verbose = FALSE)
+```
+
+Dimensionality reduction and clustering
+```{r}
+vis <- FindVariableFeatures(vis, selection.method = "vst", nfeatures = 3000)
+vis <- RunPCA(vis, npcs = 50, assay = "SCT", verbose = FALSE)
+vis <- RunUMAP(vis, reduction = "pca", dims = 1:50)
+vis <- FindNeighbors(vis, reduction = "pca", dims = 1:50)
+vis <- FindClusters(vis, verbose = FALSE)
+
+saveRDS(vis, "./intermediate_data/vis_qcd_dimred.rds")
+```
+
+Visium UMAP clustering
+```{r, message=FALSE, fig.width=10, fig.height=5}
+vis <- readRDS("./intermediate_data/vis_qcd_dimred.rds")
+p1 <- DimPlot(vis) + ggtitle("Colored by Seurat Clustering")
+p2 <- SpatialDimPlot(vis, label = TRUE, label.size = 3)
+p1 + p2
+```
+Combining the information from deconvolution result later, we would realize that cluster 1 is likely invasive tumor. 
+
+
+Spatial clustering with BayesSpace. First, we convert the Visium Seurat object to SingleCellExperiment object as required by BayesSpace.
+
+We carry over everything we have calculated so far for Visium, except the spatial coordinates. Seurat::Load10X_Spatial() does not keep all the spatial columns required for BayesSpace (e.g. enhanced version), and it also changes the scaling of the tissue coordinates to match with H&E image, which is incompatible with BayesSpace. Instead of using SeuratObject::GetTissueCoordinates(vis), we read in the original spatial coordinates, with the following modification. 
+```{r}
+# First, convert Visium Seurat object to SCE required by BayesSpace
+vis_mat <- vis@assays$Spatial@counts
+vis_sct <- vis@assays$SCT@counts
+
+vis_pca <- vis@reductions$pca@cell.embeddings
+vis_umap <- vis@reductions$umap@cell.embeddings
+
+# Merge in spatial coordinates from original tissue_position.csv.
+vis_coord <- read.csv(paste0(vis_path, "spatial/tissue_positions_list.csv"), header = FALSE)
+colnames(vis_coord) <- c("barcodes", "in_tissue", "row", "col", "pxl_row_in_fullres", "pxl_col_in_fullres")
+
+vis_meta <- vis@meta.data
+vis_meta$barcodes <- rownames(vis_meta)
+
+vis_CD <- vis_meta %>%
+  left_join(vis_coord)
+
+vis_sce <- SingleCellExperiment(assays = list(counts = vis_mat, 
+                                              SCTcounts = vis_sct), 
+                                reducedDims = SimpleList(PCA = vis_pca, UMAP = vis_umap),
+                                colData = vis_CD)
+
+saveRDS(vis_sce, "./intermediate_data/vis_qcd_dimred_sce.rds")
+```
+
+
+We assign the same number of clusters to BayesSpace identified by Seurat (n.cluster = 18), since we also get the confirmation of a similar number of cluster from Chromium (n.cluster = 19).  
+```{r}
+# Just FYI, there is also a speed-up version of the original Bioconductor R package BayesSpace from GitHub, for the enhanced resolution of BayesSpace (which we won't cover in this tutorial)
+# devtools::install_github(senbaikang/BayesSpace)
+library(BayesSpace)
+
+vis_sce <- readRDS("./intermediate_data/vis_qcd_dimred_sce.rds")
+
+# We assign the same number of clusters to BayesSpace identified by Seurat
+vis_sce <- vis_sce %>% 
+        # spatialPreprocess(platform="Visium", n.PCs = 50, n.HVGs = 3000) %>% 
+        spatialCluster(q = nlevels(Idents(vis)), use.dimred = "PCA", platform = "Visium", nrep = 10000)
+
+saveRDS(vis_sce, "./intermediate_data/vis_qcd_dimred_sce_bayesspace.rds")
+```
+
+```{r}
+# Save Visium BayesSpace clustering result back to Visium Seurat object for plotting
+vis_sce <- readRDS("./intermediate_data/vis_qcd_dimred_sce_bayesspace.rds")
+
+vis[["spatial.cluster"]] <- vis_sce$spatial.cluster
+```
+
+Visualize UMAP and spatial plot of Visium, colored by clustering with Seurat and BayesSpace. 
+```{r, message=FALSE, fig.width=10, fig.height=5}
+p3 <- DimPlot(vis, group.by = "spatial.cluster") + ggtitle("Colored by BayesSpace spatial clustering")
+p4 <- SpatialDimPlot(vis, group.by = "spatial.cluster", label = TRUE, label.size = 3)
+p3 + p4
+```
+We can see that BayesSpace recovers the structure of DCIS (cluster 1) better compares to Seurat clustering, which does not take into account the spatial coordinate information.  
+
+Spatially variable features identification based on spatial autocorrelation "Moran's I" index. This step takes a long time to run, so for the sake of time, it is recommended to directly load in the intermediate data. 
+```{r}
+vis <- FindSpatiallyVariableFeatures(vis, assay = "SCT", features = VariableFeatures(vis), selection.method = "moransi")
+
+vis_SVGs_6 = rownames(
+  dplyr::slice_min(
+    vis[["SCT"]]@meta.features,
+    moransi.spatially.variable.rank,
+    n = 6
+  )
+)
+```
+
+Visualize top 6 Visium SVGs in UMAP space. 
+```{r, warning=FALSE, fig.width=10, fig.height=6}
+vis_SVGs_6 = c("DCAF7", "MT-ND1", "CSDE1", "TACO1", "MIEN1", "NRAS")
+FeaturePlot(vis, features = c("DCAF7", "MT-ND1", "CSDE1", "TACO1", "MIEN1", "NRAS"), ncol = 3, raster = FALSE)
+```
+
+Visualize top 6 Visium SVGs spatially. Combining results from deconvolution, we can see that genes highly expressed in invasive tumor region has high spatial variability.
+```{r, warning=FALSE, fig.width=10, fig.height=5}
+SpatialFeaturePlot(vis, features = vis_SVGs_6)
+
+```
+
+From here on, you can perform differential expression analysis between the clusters. We save this analysis to the session of integration Visium and aggregated Xenium. 
+
+# Visium cell-type deconvolution with Chromium reference 
+```{r}
+library(spacexr)
+# chrom <- readRDS("./intermediate_data/chrom_raw.rds")
+
+# Reference Chromium, unnormalized counts
+chrom_mat <- GetAssayData(chrom, slot = "counts")
+cell_types <- as.factor(chrom$Annotation); names(cell_types) <- colnames(chrom)
+
+ref <- Reference(chrom_mat, cell_types)
+
+# Visium to be deconvolved, unnormalized counts
+coords <- GetTissueCoordinates(vis)
+counts <- GetAssayData(vis, slot = "counts")
+
+puck <- SpatialRNA(coords, counts)
+```
+
+We specify "full" mode here to indicate there can be many cells in a spot, and save RCTD results. 
+```{r, warning=FALSE, echo = FALSE}
+myRCTD <- create.RCTD(puck, ref, max_cores = 4)
+myRCTD <- run.RCTD(myRCTD, doublet_mode = 'full')
+saveRDS(myRCTD, "./intermediate_data/vis_RCTD.rds")
+```
+
+Organize cell-type deconvolution results, the weights should be normalized so the proportion of each cell type in a spot sums up to 1.
+```{r}
+myRCTD <- readRDS("./intermediate_data/vis_RCTD.rds")
+results <- myRCTD@results
+norm_weights <- normalize_weights(results$weights)
+cell_type_names <- myRCTD@cell_type_info$info[[2]]
+spatialRNA <- myRCTD@spatialRNA
+barcodes <- colnames(myRCTD@spatialRNA@counts)
+```
+
+Plot cell-type deconvolution result. We first check the deconvolution result for one cell-type. Here we set the intensity range based on the probability score range of this cell-type across all spots. 
+```{r, message=FALSE, fig.width=5, fig.height=4.5}
+# range(norm_weights[, cell_type_names[1]])
+# 1.072845e-05 3.576271e-01
+
+plot_puck_continuous(spatialRNA, barcodes, norm_weights[, cell_type_names[1]], title = cell_type_names[1], ylimit = c(0, 0.4), size = 0.8) + coord_flip() + scale_x_reverse()
+
+```
+
+We then separate the remaining cell types into two batches for the sake of clarity in visualization. All these plots have the color scale intensity ranging from 0 to 1. (Note the plot is stretched horizontally in the below limited plotting space, but the orientation matches the H&E spatial feature plot of Visium.) 
+```{r, message=FALSE, fig.width=10, fig.height=11}
+p <- list()
+for (i in 2:10){
+  which_cell_type <- cell_type_names[i]
+  p[[i-1]] <- plot_puck_continuous(spatialRNA, barcodes, norm_weights[, which_cell_type], title = which_cell_type) + coord_flip() + scale_x_reverse() + theme(legend.position = "none")
+}
+do.call(grid.arrange, p)
+
+```
+
+
+```{r, message=FALSE, fig.width=10, fig.height=11}
+p <- list()
+for (i in 11:19){
+  which_cell_type <- cell_type_names[i]
+  p[[i-10]] <- plot_puck_continuous(spatialRNA, barcodes, norm_weights[, which_cell_type], title = which_cell_type) + coord_flip() + scale_x_reverse() + theme(legend.position = "none")
+}
+do.call(grid.arrange, p)
+```
+
+In addition, you can save the plots with the commented code. 
+```{r}
+## save to local directory
+# RCTD_result_path <- "./results/"
+# for (i in 1:length(cell_type_names)){
+#   which_cell_type <- cell_type_names[i]
+#   plot_puck_continuous(puck, barcodes, norm_weights[, which_cell_type], title = which_cell_type) + coord_flip() + 
+#     scale_x_reverse()
+#   ggsave(path = RCTD_result_path, filename = paste0(which_cell_type, ".png"))
+# }
+```
+
+
+# Xenium Analysis
+
+In the Seurat Xenium tutorial, subcelluar transcripts and cell segmentation boundaries are loaded with the function Seurat::LoadXenium(). For the purpose of this tutorial, we will not dive deep into cell-segmentation, an ongoing research topic in the field of machine learning and medical imaging. We instead focus on exploring the concordance and integration between Chromium, Visium, and Xenium. Therefore, cellular-level resolution of Xenium is enough with the following approach.
+
+Read in Xenium as Seurat object with assay name as `"Xenium"`. We keep only relevant metadata columns. Unlike Visium, the spatial coordinates are stored in `xe@images$fov@boundaries$centroids@coords` in the Seurat object, which can be obtained by `GetTissueCoordinates()`. We save a copy of the spatial coordinates to Xenium object metadata for easier retrieval. 
+```{r, message=FALSE, warning=FALSE}
+xe_path <- paste0(root_path, "Xenium/outs/")
+xe <- LoadXenium(xe_path)
+
+xe@meta.data <- xe[[c("orig.ident", "nCount_Xenium", "nFeature_Xenium")]]
+xe[[c("array_col", "array_row")]] <- GetTissueCoordinates(xe)
+dim(xe)           # 313 167780
+
+# saveRDS(xe, "./intermediate_data/xe_raw.rds")
+```
+
+Visualize the distribution of library size and per-cell feature detection of Xenium with violin plot. For Xenium object, Seurat renamed the feature names from `"nCount_Spatial"` to `"nCount_Xenium"`, and similarly for `nFeature_*`.
+```{r}
+xe <- readRDS("./intermediate_data/xe_raw.rds")
+VlnPlot(xe, features = c("nCount_Xenium", "nFeature_Xenium"), pt.size = 0, raster = FALSE)
+```
+
+Visualize spatial feature plot. For Xenium object, Seurat changed the helper function from `"SpatialFeaturePlot()"` to `"ImageFeaturePlot()"`. 
+```{r}
+ImageFeaturePlot(xe, features = c("nCount_Xenium", "nFeature_Xenium"))
+
+```
+
+QC Xenium with single-cell method, where low count library size are detected with scuttle::isOutlier() function. 
+```{r , message=FALSE, warning=FALSE}
+# Takes a Seurat object instead of SPE
+xe <- addQCMetrics_seu(xe)
+
+xe_libsize_drop <- xe$libsize_drop
+
+if(any(xe_libsize_drop)){
+  wrap_plots(plot_Hist_Low_Lib_Sizes(xe), 
+             plotQCSpatial_seu(xe, flag = "libsize_drop"))
+}
+```
+
+```{r}
+xe_mito_drop <- na.omit(xe$mito_drop)
+if(any(xe_mito_drop)){
+  plot_Hist_High_Mito_Props(xe)
+}else{
+  print("No mitochondria genes in this Xenium data")
+}
+```
+
+```{r}
+xe_lowgenecount_drop <- unlist(xe[[names(xe@assays)[1]]][["lowgenecount_drop"]])
+
+if(any(xe_lowgenecount_drop)){
+  plot_Hist_Low_Abun_Genes(xe)
+}
+```
+
+
+Subsetting Xenium and remove cells did not pass QC criteria above.
+```{r, warning=FALSE}
+xe <- xe[!xe_lowgenecount_drop, !xe_libsize_drop] 
+dim(xe)           #  313 167780 -> 305 162219
+
+saveRDS(xe, "./intermediate_data/xe_qcd.rds")
+```
+
+
+# Xenium analysis
+Normalization with SCTransform
+```{r}
+xe <- readRDS("./intermediate_data/xe_qcd.rds")
+xe <- SCTransform(xe, assay = "Xenium")
+```
+
+Since Xenium has very few genes (313 in the original data and 305 after QC), we will skip the step of finding highly variable genes, and run PCA on all 305 genes with 50 PCs. This steps takes in total around 8 minutes to run.
+```{r, message=FALSE}
+xe <- RunPCA(xe, npcs = 50, assay = "SCT", features = rownames(xe))
+xe <- FindNeighbors(xe, reduction = "pca", dims = 1:50)
+xe <- FindClusters(xe, verbose = FALSE)
+xe <- RunUMAP(xe, dims = 1:50)
+
+saveRDS(xe, "./intermediate_data/xe_qcd_dimred.rds")
+```
+
+Visualize UMAP of Xenium, colored by clustering with Seurat. SpatialDimPlot() cannot be directly used here with `SlideSeq` class, so we use our own helper functions `extractCol()` to extract the color of DimPlot and ensure the same palette is used for `SpatialFeaturePlot_cate()`. 
+```{r, warning=FALSE, fig.width=10, fig.height=5}
+xe <- readRDS("./intermediate_data/xe_qcd_dimred.rds")
+p1 <- DimPlot(xe, raster = FALSE)
+p2 <- ImageDimPlot(xe, size = 0.50, dark.background = FALSE)
+
+p1 + p2
+```
+Combining deconvolution result from Chromium and Visium, we can see that cluster 2 (orange) is likely the Stromal region. (Note here you would need to rotate and flip the orientation of the spatial data between Visium and Xenium.)
+
+
+Identify top 6 highly expressed genes in Xenium.
+```{r}
+# Take the raw data after QC
+xe_mat <- GetAssayData(xe, slot = "counts")
+# dim(xe_mat) # 304 117740
+
+xe_HEGs <- data.frame(
+  gene_name = rownames(xe_mat),
+  mean_expr = rowMeans(xe_mat)) %>%
+  arrange(desc(mean_expr))
+
+head(xe_HEGs)
+```
+
+Visualize top 6 Xenium HEGs in UMAP space. 
+```{r, warning=FALSE, fig.width=10, fig.height=6}
+FeaturePlot(xe, features = xe_HEGs$gene_name[1:6], ncol = 3, raster = FALSE)
+```
+
+Visualize top 6 Xenium HEGs spatially. 
+```{r, warning=FALSE, fig.width=10, fig.height=5}
+ImageFeaturePlot(xe, features = xe_HEGs$gene_name[1:6])
+
+```
+
+Here you can modify the code for finding spatially variable genes in Visium and adapt it to Xenium. This step would take extra long to run due to the huge data size of Xenium, so it is recommended to run it on HPC and saved the intermediate object. For the sake of time, we will skip this step for Xenium. 
+
+Xenium annotation with a Chromium reference, using SingleR. The reference dataset Chromium must contain log-transformed normalized data. From SingleR bookdown, this requirement is needed because the default marker detection scheme computes log-fold changes by subtracting the medians, so naturally the expression values should already be log-transformed. On the other hand, the test dataset Xenium does not need to be log-transformed or even (scale) normalized, because `SingleR()` computes within cell Spearman correlation that is unaffected by transformations. 
+
+We annotate on the cells rather than on Seurat identified clusters, but not specifying `clusters = ` in `SingleR()`.
+```{r}
+# Convert Chromium Seurat to SCE, and perform log normalization
+chrom_sce <- as.SingleCellExperiment(chrom)
+chrom_sce <- scuttle::logNormCounts(chrom_sce)
+
+# Convert Xenium to SCE
+xe_sce <- SingleCellExperiment(
+  assays = list(counts = GetAssayData(xe, assay = "Xenium", slot = "counts"))
+)
+
+xe_predictions <- SingleR(test = xe_sce, assay.type.test = "counts", 
+                          ref = chrom_sce, assay.type.ref = "logcounts", 
+                          labels = chrom$Annotation) 
+
+saveRDS(xe_predictions, "./intermediate_data/xe_SingleRpred.rds")
+
+# Add the prediction to Xenium object
+xe[["SingleR.labels"]] <- xe_predictions$labels
+```
+
+
+Visualize the Xenium SingleR annotation compared to Seurat clustering. We can see some commonality in the patterns. 
+```{r, warning=FALSE, fig.width=10, fig.height=5}
+p1 <- ImageDimPlot(xe, group.by = "seurat_clusters", size = 0.50, dark.background = FALSE)
+p2 <- ImageDimPlot(xe, group.by = "SingleR.labels", size = 0.50, dark.background = FALSE)
+
+p1 + p2
+```
+
+
+
+# Xenium Integration with Visium
+## Image Alignment
+First, we check the similarity between Visium and Xenium images. Visium comes with a H&E image. 
+```{r, message=FALSE}
+img_vis <- magick::image_read(paste0(vis_path, "spatial/tissue_lowres_image.png"))
+magick::image_scale(img_vis)
+```
+
+Then we visualize the Xenium image. It can be obtained by taking a screenshot of the .ome.tif object in Xenium raw data, which was read in using a Java software Fiji. Note that after some scaling and rotation, Xenium can be aligned to Visium. In image processing, such transformation can be done by multiplying the source image with a linear affine transformation matrix, to map it onto the same scale as the target image. 
+```{r, message=FALSE}
+img_xe <- magick::image_read(paste0(xe_path, "../Xenium_ome_tif.png"))
+magick::image_scale(magick::image_rotate(img_xe, 90), "x400")
+
+```
+
+There are many ways of image registration. Most available software are in Python with certain plugins, such as Fiji. SpatialData is a new Python package that requires user-selected landmarks to align images. `RNiftyReg` is a image registration R package. However, the automatic registration does not work well on image with very different scale and intensity, such as in this use case of Xenium and Visium. Therefore, we use the transformation matrix provided by 10x, which was done by registration with Python and Fiji. 
+```{r}
+# Affine matrix aligned by 10X
+trans_mtx <- matrix(
+  c(
+    8.82797498e-02, -1.91831377e+00,  1.63476055e+04,
+    1.84141210e+00,  5.96797885e-02,  4.12499099e+03,
+    -3.95225478e-07, -4.66405945e-06,  1.03706895e+00
+  ),
+  nrow = 3, byrow= TRUE
+)
+trans_mtx
+```
+
+## Aggregate Xenium into circles as Visium
+We have developed a Bioconductor R package for binning any single-cell resolution spatial data into spots, which can be useful in checking correlations between technical replicates of the same technology, identify artifacts across technologies, and checking cell density (number of cells per spot). The user can choose to bin from transcript-level (sub-cellular) or cell-level. Our package `bin2spot` will soon be available to the public after some optimization with the speed in the backend. 
+```{r}
+# aggxe <- bin2spot::aggregate_xenium(xe, scaling_factor)
+```
+For this tutorial, we have saved the output of the binned Xenium object, aggregated by our lab member. 
+
+## Read aggregated Xenium as Visium object
+After aggregation, we can read in aggregated Xenium with the Seurat function for reading Visium. Visualize aggregated Xenium with H&E image.
+```{r}
+aggxe_path <- paste0(root_path, "AggXe/outs/")
+# xe_path <- "~/Desktop/PhDWork/1st_year_BC2_Conf/intermediate_data/Visium/outs/"
+aggxe <- Load10X_Spatial(aggxe_path)
+SpatialFeaturePlot(aggxe, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Aggregated Xenium")
+saveRDS(aggxe, "./intermediate_data/aggxe_raw.rds")
+```
+
+QC aggregated Xenium. we follow the same rule for Visium. 
+```{r, warning=FALSE, fig.width=8, fig.height=5}
+aggxe <- readRDS("./intermediate_data/aggxe_raw.rds")
+# Prepare mitochondria percentage 
+aggxe$percent.mt <- PercentageFeatureSet(aggxe, pattern = "^MT-")
+VlnPlot(aggxe, features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"), pt.size = 0.1)
+```
+
+There are no mitochondria genes in Xenium. We apply the same threshold of Visium to aggregated Xenium, and set the threshold at 100 for total library size and feature detected per spot.  
+```{r}
+head(sort(aggxe$nCount_Spatial), 20)
+table(isOutlier(aggxe$nCount_Spatial, type = "lower"))
+```
+
+```{r}
+head(sort(aggxe$nFeature_Spatial), 20)
+table(isOutlier(aggxe$nFeature_Spatial, type = "lower"))
+```
+
+Most of the low count spots are at the border, so it is reasonable to remove. 
+```{r, fig.width=6, fig.height=4}
+aggxe$low_count_spots <- aggxe$nCount_Spatial < 100 | aggxe$nFeature_Spatial < 100
+plotQCSpatial_seu(aggxe, flag = "low_count_spots")
+```
+
+Derive low abundance genes, and there is no low abundance genes in aggregated Xenium.
+```{r}
+aggxe_lowgenecount_drop <- rowSums(GetAssayData(aggxe, "counts") > 0) < 20
+table(aggxe_lowgenecount_drop)
+```
+
+Eliminate genes and spots did not pass QC:
+```{r}
+aggxe <- aggxe[!aggxe_lowgenecount_drop,  # low abundance genes
+               !aggxe$low_count_spots ]     # low library size & number of detected genes per spot
+
+dim(aggxe) # 313 3931
+saveRDS(aggxe, "./intermediate_data/aggxe_qcd.rds")
+```
+
+
+We put Visium and aggregated Xenium side by side
+```{r, message=FALSE, fig.width=8, fig.height=4}
+vis <- readRDS("./intermediate_data/vis_qcd.rds")
+aggxe <- readRDS("./intermediate_data/aggxe_qcd.rds")
+p1 <- SpatialFeaturePlot(vis, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Visium")
+p2 <- SpatialFeaturePlot(aggxe, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Aggregated Xenium")
+
+p1 + p2
+```
+
+Subset both Visium and Xenium to common spots 
+```{r}
+aggxe <- readRDS("./intermediate_data/aggxe_qcd.rds")
+vis <- readRDS("./intermediate_data/vis_qcd.rds")
+
+common_spots <- intersect(colnames(aggxe), colnames(vis)) # 3928
+common_genes <- intersect(rownames(aggxe), rownames(vis)) # 306
+
+vis <- vis[rownames(vis) %in% common_genes, colnames(vis) %in% common_spots]
+aggxe <- aggxe[rownames(aggxe) %in% common_genes, colnames(aggxe) %in% common_spots]
+
+dim(vis) # 18019 4988 -> 306 3928
+dim(aggxe) # 313 3931 -> 306 3928
+
+saveRDS(vis, "./intermediate_data/integr_vis_sub.rds")
+saveRDS(aggxe, "./intermediate_data/integr_aggxe_sub.rds")
+```
+
+Now we should see Visium and aggregated Xenium on the same range
+```{r, message=FALSE, fig.width=8, fig.height=4}
+vis <- readRDS("./intermediate_data/integr_vis_sub.rds")
+aggxe <- readRDS("./intermediate_data/integr_aggxe_sub.rds")
+
+p1 <- SpatialFeaturePlot(vis, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Visium")
+p2 <- SpatialFeaturePlot(aggxe, features = "nCount_Spatial") + theme(legend.position = "right") + ggtitle("Aggregated Xenium")
+
+p1 + p2
+```
+
+# Joint clustering of Visium and Xenium with BayesSpace
+
+Convert Visium and Aggregated Xenium Seurat object to SCE. Here we follow the the same idea of what we have done for Visium previously.
+```{r, message=FALSE}
+vis <- readRDS("./intermediate_data/integr_vis_sub.rds")
+
+# Obtain the count matrix from Seurat object. 
+vis_mat <- vis@assays$Spatial@counts
+
+# Merge in spatial coordinates from original tissue_position.csv.
+vis_coord <- read.csv(paste0(vis_path, "spatial/tissue_positions_list.csv"), header = FALSE)
+colnames(vis_coord) <- c("barcodes", "in_tissue", "row", "col", "pxl_row_in_fullres", "pxl_col_in_fullres")
+
+vis_meta <- vis@meta.data
+vis_meta$barcodes <- rownames(vis_meta)
+
+vis_CD <- vis_meta %>%
+  left_join(vis_coord)
+
+vis_sce <- SingleCellExperiment(assays = list(counts = vis_mat), 
+                                colData = vis_CD)
+vis_sce$orig.ident <- "Visium"
+
+saveRDS(vis_sce, "./intermediate_data/integr_vis_sub_sce.rds")
+```
+
+We do the same conversion for aggregated Xenium. 
+```{r, message=FALSE}
+aggxe <- readRDS("./intermediate_data/integr_aggxe_sub.rds")
+# Obtain the count matrix from Seurat object. 
+aggxe_mat <- aggxe@assays$Spatial@counts
+
+# Merge in spatial coordinates from original tissue_position.csv.
+aggxe_coord <- read.csv(paste0(aggxe_path, "spatial/tissue_positions_list.csv"), header = FALSE)
+colnames(aggxe_coord) <- c("barcodes", "in_tissue", "row", "col", "pxl_row_in_fullres", "pxl_col_in_fullres")
+
+aggxe_meta <- aggxe@meta.data
+aggxe_meta$barcodes <- rownames(aggxe_meta)
+
+aggxe_CD <- aggxe_meta %>%
+  left_join(aggxe_coord)
+
+aggxe_sce <- SingleCellExperiment(assays = list(counts = aggxe_mat), 
+                                  colData = aggxe_CD)
+aggxe_sce$orig.ident <- "AggregatedXenium"
+
+saveRDS(aggxe_sce, "./intermediate_data/integr_aggxe_sub_sce.rds")
+```
+
+Save the combined object
+```{r}
+vis_aggxe_sce <- cbind(vis_sce, aggxe_sce)
+saveRDS(vis_aggxe_sce, "./intermediate_data/integr_vis_aggxe_sce.rds")
+```
+
+Preprocess the data with log normalization and 50 PCs. 
+```{r}
+vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce.rds")
+set.seed(123)
+vis_aggxe_sce <- spatialPreprocess(vis_aggxe_sce, n.PCs = 50) #lognormalize, PCA
+```
+
+Check batch effect between Visium and aggregated Xenium. 
+```{r, fig.width=6, fig.height=4}
+set.seed(123)
+vis_aggxe_sce = runUMAP(vis_aggxe_sce, dimred = "PCA")
+colnames(reducedDim(vis_aggxe_sce, "UMAP")) = c("UMAP1", "UMAP2")
+
+ggplot(data.frame(reducedDim(vis_aggxe_sce, "UMAP")), 
+       aes(x = UMAP1, y = UMAP2, color = factor(vis_aggxe_sce$orig.ident))) +
+  geom_point() +
+  labs(color = "Sample") +
+  theme_bw() + ggtitle("Batch effect between Visium and aggregated Xenium")
+```
+
+There is a noticeable batch effect. We use Harmony to integrate the two samples.
+```{r, fig.width=6, fig.height=4}
+# install.packages("devtools")
+# devtools::install_github("immunogenomics/harmony")
+
+vis_aggxe_sce = RunHarmony(vis_aggxe_sce, "orig.ident", verbose = F)
+vis_aggxe_sce = runUMAP(vis_aggxe_sce, dimred = "HARMONY", name = "UMAP.HARMONY")
+colnames(reducedDim(vis_aggxe_sce, "UMAP.HARMONY")) = c("UMAP1", "UMAP2")
+
+ggplot(data.frame(reducedDim(vis_aggxe_sce, "UMAP.HARMONY")), 
+       aes(x = UMAP1, y = UMAP2, color = factor(vis_aggxe_sce$orig.ident))) +
+  geom_point() +
+  labs(color = "Sample") +
+  theme_bw() + ggtitle("UMAP after batch correction")
+
+```
+
+
+Misalign the coordinates.
+```{r}
+# range(vis_aggxe_sce$row) # 0 77
+# range(vis_aggxe_sce$col) # 0 103
+
+# Keep Visium unmoved, but shift the coordinates of aggregated Xenium to the right. 
+vis_aggxe_sce$row[vis_aggxe_sce$orig.ident == "AggregatedXenium"] <- 
+  vis_aggxe_sce$row[vis_aggxe_sce$orig.ident == "AggregatedXenium"] + 100
+
+# add columns names needed for using BayesSpace build-in plotting function
+vis_aggxe_sce$array_row <- vis_aggxe_sce$row
+vis_aggxe_sce$array_col <- vis_aggxe_sce$col
+
+# Use BayesSpace's build-in function to make sure there is no overlap in the coordinates.
+clusterPlot(vis_aggxe_sce, "orig.ident", color = NA) # +
+  # labs(fill = "orig.ident", title = "Offset check")
+```
+
+Joint clustering of combined object of Visium and aggregated Xenium.
+```{r}
+vis_aggxe_sce <- vis_aggxe_sce %>% 
+        spatialCluster(q=24, platform="Visium", nrep = 10000)
+```
+
+
+Differential expression analysis with integrated Visium and aggregated Xenium. We use log normalized data and BayesSpace clustering for differential expression analysis and marker finding. 
+```{r}
+# We use Log Normalized data for 
+xe <- 
+# Select top n markers from each cluster (by log fold change)
+xe_de_markers <- Seurat::FindAllMarkers(vis_aggxe_sce, assay='', slot='data',
+                                      group.by='spatial.cluster',
+                                      logfc.threshold=1, only.pos=TRUE) %>% 
+  group_by(cluster) %>% 
+  top_n(n_markers, avg_logFC)
+```

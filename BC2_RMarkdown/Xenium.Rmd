@@ -1,0 +1,231 @@
+---
+title: "BC2 Spatial Transcriptomics Workshop"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: 
+      collapsed: false
+date: '`r format(Sys.Date(), "%d %B, %Y")`'
+author: Estella Yixing Dong
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+
+```{r lib, warning=FALSE}
+root_path <- "~/Desktop/raw_data_must/"
+chrom_path <- paste0(root_path, "Chromium/")
+vis_path <- paste0(root_path, "Visium/outs/")
+xe_path <- paste0(root_path, "Xenium/outs/")
+aggxe_path <- paste0(root_path, "AggXe/outs/")
+
+suppressMessages({
+  library(Seurat)
+  library(BayesSpace)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tibble)
+  library(scater)
+  library(scran)
+  library(scuttle)
+  library(grid)
+  library(hrbrthemes)
+  library(gridExtra)
+  library(SingleR)
+  library(magick)
+  library(harmony)
+  library(scales)
+  library(knitr)
+  library(here)
+  library(cowplot)
+})
+
+source("utils_new.R")
+```
+
+# Xenium Analysis
+
+## Read in Xenium
+In the Seurat Xenium tutorial, subcelluar transcripts and cell segmentation boundaries are loaded with the function Seurat::LoadXenium(). For the purpose of this tutorial, we will not dive deep into cell-segmentation, an ongoing research topic in the field of machine learning and medical imaging. We instead focus on exploring the concordance and integration between Chromium, Visium, and Xenium. Therefore, cellular-level resolution of Xenium is enough with the following approach.
+
+Read in Xenium as Seurat object with assay name as `"Xenium"`. We keep only relevant metadata columns. Unlike Visium, the spatial coordinates are stored in `xe@images$fov@boundaries$centroids@coords` in the Seurat object, which can be obtained by `GetTissueCoordinates()`. 
+```{r, message=FALSE, warning=FALSE, eval = FALSE}
+xe_path <- paste0(root_path, "Xenium/outs/")
+xe <- LoadXenium(xe_path)
+
+# xe[[c("array_col", "array_row")]] <- GetTissueCoordinates(xe)
+dim(xe)           # 313 167780
+
+# saveRDS(xe, "./intermediate_data/xe_raw.rds")
+```
+
+## Xenium QC
+Visualize the distribution of library size and per-cell feature detection of Xenium with violin plot. For Xenium object, Seurat renamed the feature names from `"nCount_Spatial"` to `"nCount_Xenium"`, and similarly for `nFeature_*`.
+```{r}
+xe <- readRDS("./intermediate_data/xe_raw.rds")
+VlnPlot(xe, features = c("nCount_Xenium", "nFeature_Xenium"), pt.size = 0, raster = FALSE)
+```
+
+Visualize spatial feature plot. For Xenium object, Seurat changed the helper function from `"SpatialFeaturePlot()"` to `"ImageFeaturePlot()"`. 
+```{r, fig.width=10}
+p1 <- ImageFeaturePlot(xe, features = "nCount_Xenium") + scale_x_reverse() + scale_y_reverse()
+p2 <- ImageFeaturePlot(xe, features = "nFeature_Xenium") + scale_x_reverse() + scale_y_reverse()
+
+p1 + p2
+```
+
+### Per-cell QC
+QC Xenium with single-cell method, where low count library size are detected with scuttle::isOutlier() function. Check library size flag. 
+```{r , message=FALSE, warning=FALSE, fig.width=10, fig.height=4}
+# Takes a Seurat object instead of SPE
+xe <- addQCMetrics_seu(xe)
+
+xe_libsize_drop <- xe$libsize_drop
+
+if(any(xe_libsize_drop)){
+  wrap_plots(plot_Hist_Low_Lib_Sizes(xe), 
+             plotQCSpatial_seu(xe, flag = "libsize_drop")) + scale_x_reverse() + scale_y_reverse()
+}
+```
+
+Check mitochondria percentage flag. 
+```{r}
+xe_mito_drop <- na.omit(xe$mito_drop)
+if(any(xe_mito_drop)){
+  plot_Hist_High_Mito_Props(xe)
+}else{
+  print("No mitochondria genes in this Xenium data")
+}
+```
+
+### Per-gene QC
+Check if there are any low abundance gene with mean gene expression lower than exp(-5).
+```{r, fig.width=5, fig.height=4}
+xe_lowgenecount_drop <- unlist(xe[[names(xe@assays)[1]]][["lowgenecount_drop"]])
+
+if(any(xe_lowgenecount_drop)){
+  plot_Hist_Low_Abun_Genes(xe)
+}
+```
+
+### Post QC subsetting
+Subsetting Xenium and remove cells did not pass QC criteria above.
+```{r, warning=FALSE}
+xe <- xe[!xe_lowgenecount_drop, !xe_libsize_drop] 
+dim(xe)           #  313 167780 -> 305 162219
+
+# saveRDS(xe, "./intermediate_data/xe_qcd.rds")
+```
+
+
+# Xenium analysis
+## Xenium normalization
+Normalization with SCTransform
+```{r, eval = FALSE}
+xe <- readRDS("./intermediate_data/xe_qcd.rds")
+xe <- SCTransform(xe, assay = "Xenium")
+```
+
+## Xenium dimension reduction and clustering
+Since Xenium has very few genes (313 in the original data and 305 after QC), we will skip the step of finding highly variable genes, and run PCA on all 305 genes with 50 PCs. This steps takes in total around 8 minutes to run.
+```{r, message=FALSE, eval = FALSE}
+xe <- RunPCA(xe, npcs = 50, assay = "SCT", features = rownames(xe))
+xe <- FindNeighbors(xe, reduction = "pca", dims = 1:50)
+xe <- FindClusters(xe, verbose = FALSE)
+xe <- RunUMAP(xe, dims = 1:50)
+
+# saveRDS(xe, "./intermediate_data/xe_qcd_dimred.rds")
+```
+
+### Xenium highly expressed genes
+Identify top 6 highly expressed genes (HEGs) in Xenium.
+```{r}
+# Take the raw data after QC
+xe_mat <- GetAssayData(xe, slot = "counts")
+# dim(xe_mat) # 304 117740
+
+xe_HEGs <- data.frame(
+  gene_name = rownames(xe_mat),
+  mean_expr = rowMeans(xe_mat)) %>%
+  arrange(desc(mean_expr))
+
+head(xe_HEGs)
+```
+
+Visualize top 6 Xenium HEGs in UMAP space. 
+```{r, warning=FALSE, fig.width=10, fig.height=6}
+xe <- readRDS("./intermediate_data/xe_qcd_dimred.rds")
+FeaturePlot(xe, features = xe_HEGs$gene_name[1:6], ncol = 3, raster = FALSE)
+```
+
+Visualize top 6 Xenium HEGs spatially. 
+```{r, warning=FALSE, fig.width=12}
+markers <- xe_HEGs$gene_name[1:6]
+feat.plots <- purrr::map(markers, 
+                         function(x) ImageFeaturePlot(xe, x) + scale_x_reverse() + scale_y_reverse())
+patchwork::wrap_plots(feat.plots, ncol=3)
+
+```
+
+Here you can modify the code for finding spatially variable genes in Visium and adapt it to Xenium. This step would take extra long to run due to the huge data size of Xenium, so it is recommended to run it on HPC and saved the intermediate object. For the sake of time, we will skip this step for Xenium. 
+
+### Visualize Seurat clustering result
+Visualize UMAP of Xenium, colored by clustering with Seurat. SpatialDimPlot() cannot be directly used here with `SlideSeq` class, so we use our own helper functions `extractCol()` to extract the color of DimPlot and ensure the same palette is used for `SpatialFeaturePlot_cate()`. 
+```{r, warning=FALSE, fig.width=10, fig.height=5}
+xe <- readRDS("./intermediate_data/xe_qcd_dimred.rds")
+p1 <- DimPlot(xe, raster = FALSE) + ggtitle("Colored by Seurat Clustering")
+p2 <- ImageDimPlot(xe, size = 0.50, dark.background = FALSE) + scale_x_reverse() + scale_y_reverse()
+
+p1 + p2
+```
+Combining deconvolution result from Chromium and Visium, we can see that cluster 2 (orange) is likely the Invasive Tumor region.
+
+
+
+# Xenium Annotation
+Xenium annotation with a Chromium reference, using SingleR. The reference dataset Chromium must contain log-transformed normalized data. From SingleR bookdown, this requirement is needed because the default marker detection scheme computes log-fold changes by subtracting the medians, so naturally the expression values should already be log-transformed. On the other hand, the test dataset Xenium does not need to be log-transformed or even (scale) normalized, because `SingleR()` computes within cell Spearman correlation that is unaffected by transformations. 
+
+## Run SingleR
+We annotate on the cells rather than on Seurat identified clusters, by not specifying `clusters = ` in `SingleR()`.
+```{r, eval = FALSE}
+chrom <- readRDS("./intermediate_data/chrom_raw.rds")
+# Convert Chromium Seurat to SCE, and perform log normalization
+chrom_sce <- as.SingleCellExperiment(chrom)
+chrom_sce <- scuttle::logNormCounts(chrom_sce)
+
+# Convert Xenium to SCE
+xe_sce <- SingleCellExperiment(
+  assays = list(counts = GetAssayData(xe, assay = "Xenium", slot = "counts"))
+)
+
+# DO NOT RUN - TAKING TOO LONG
+xe_predictions <- SingleR(test = xe_sce, assay.type.test = "counts", 
+                          ref = chrom_sce, assay.type.ref = "logcounts", 
+                          labels = chrom$Annotation) 
+
+# saveRDS(xe_predictions, "./intermediate_data/xe_SingleRpred.rds")
+```
+
+## Visualize clustering vs. annotation
+Visualize the Xenium SingleR annotation compared to Seurat clustering. We can see some commonality in the patterns. 
+```{r, warning=FALSE, fig.width=10, fig.height=5}
+xe <- readRDS("./intermediate_data/xe_qcd_dimred.rds")
+xe_predictions <- readRDS("./intermediate_data/xe_SingleRpred.rds")
+# Add the prediction to Xenium object
+xe[["SingleR.labels"]] <- xe_predictions$labels
+
+p1 <- ImageDimPlot(xe, group.by = "seurat_clusters", size = 0.50, dark.background = FALSE) + scale_x_reverse() + scale_y_reverse()
+p2 <- ImageDimPlot(xe, group.by = "SingleR.labels", size = 0.50, dark.background = FALSE) + scale_x_reverse() + scale_y_reverse()
+
+p1 + p2
+```
+
+
+
+
+
