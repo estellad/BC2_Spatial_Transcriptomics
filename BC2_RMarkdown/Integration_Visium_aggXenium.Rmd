@@ -53,7 +53,7 @@ source("utils_new.R")
 # Xenium Integration with Visium
 ## Image Alignment
 ### Visualize and rotate Visium and Xenium
-First, we check the similarity between Visium and Xenium images. Visium comes with a H&E image. 
+First, we check the similarity between Visium and Xenium images. Visium comes with an H&E image. 
 
 Then we visualize the Xenium image. It can be obtained by taking a screenshot of the .ome.tif object in Xenium raw data, which was read in using a Java software Fiji. Note that after some scaling and rotation, Xenium can be aligned to Visium. In image processing, such transformation can be done by multiplying the source image with a linear affine transformation matrix, to map it onto the same scale as the target image. 
 ```{r, echo = FALSE}
@@ -79,7 +79,7 @@ ggdraw() +
 ### Various image registration methods
 There are many ways of image registration in R, Python, with other plug-ins. 
 
-* `SpatialData` is a Python package that requires user-selected landmarks to align images. Here shows the registration of Visium onto Xenium in `SpatialData`'s napari interface [@marconato2023spatialdata].
+* `SpatialData` is a Python package that requires user-selected landmarks to align images. Here we show the registration of Visium onto Xenium in `SpatialData`'s napari interface [@marconato2023spatialdata].
 ```{r, fig.width=6, echo=FALSE, fig.align='center'}
 knitr::include_graphics(here::here("www/Vis_to_Xe_SpaData.png"), error = FALSE)
 ```
@@ -96,11 +96,11 @@ knitr::include_graphics(here::here("www/RNiftyReg2.png"), error = FALSE)
 ```
 
 |            However, the automation does not work well on images with very different orientation, scale, and intensity,
-|            such as in this use-case of Xenium and Visium.  
+|            such as in this use case of Xenium and Visium.  
 
 <br>
 
-* Therefore, we use the transformation matrix provided by 10x, which was done by registration with Python and a Java plug-in Fiji. The following matrix is the result of registering Xenium onto Visium.
+* Therefore, we use the transformation matrix provided by 10x, which was done by registration with Python and a Java plug-in Fiji. The following matrix is the result of registering Xenium onto Visium [@pyfijiregistration202310x].
   ```{r, message=FALSE, eval=FALSE}
   # Affine matrix aligned by 10X
   trans_mtx <- matrix(
@@ -140,7 +140,7 @@ SpatialFeaturePlot(aggxe, features = "nCount_Spatial") + theme(legend.position =
 
 ## Aggregated Xenium QC
 ### Per-spot QC
-QC aggregated Xenium. we follow the same rule for Visium. 
+QC aggregated Xenium. We follow the same rule for Visium. 
 ```{r, warning=FALSE, fig.width=8, fig.height=5}
 aggxe <- readRDS("./intermediate_data/aggxe_raw.rds")
 # Prepare mitochondria percentage 
@@ -408,7 +408,7 @@ vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce_batch_correct
 plotClusterUMAP(vis_aggxe_sce, cluster_name = "spatial.cluster", facet = "orig.ident")
 ```
 
-Then we check the join spatial clusters in the tissue. 
+Then we check the joint spatial clusters in the tissue. 
 ```{r, fig.width=10, fig.width=9}
 vis_aggxe_sce <- readRDS("./intermediate_data/integr_vis_aggxe_sce_batch_corrected_offset_bayesspace.rds")
 
@@ -417,7 +417,7 @@ clusterPlot(vis_aggxe_sce, "spatial.cluster", color = NA, size = 0.1) +
 
 ```
 
-On the left is aggregated Xenium, and on the right is Visium. We see high concordnace between the two modalities. Additionally, aggregated Xenium returns higher granularity in general. 
+On the left is aggregated Xenium, and on the right is Visium. We see high concordance between the two modalities. Additionally, aggregated Xenium returns higher granularity in general. 
 
 
 From here on, you can identify the markers in each cluster, and do differential expression analysis between clusters, by the method of your choice (e.g. Seurat, CSIDE, etc.)

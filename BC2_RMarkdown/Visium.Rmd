@@ -116,7 +116,7 @@ dim(vis) # 18019  4988
 ```
 
 ## Visium normalization
-Normalization with SCTransform, as recommended by Seurat framework. 
+Normalization with SCTransform, as recommended by Seurat framework. `SCTransform()` replaces the `NormalizeData()`, `ScaleData()`, and `FindVariableFeatures()` steps, with default number of variable features as 3000.
 ```{r, eval = FALSE}
 # vis <- readRDS("./intermediate_data/vis_qcd.rds")
 vis <- SCTransform(vis, assay = "Spatial", verbose = FALSE)
@@ -125,7 +125,6 @@ vis <- SCTransform(vis, assay = "Spatial", verbose = FALSE)
 ## Visium dimension reduction and clustering
 Dimensionality reduction and clustering with Seurat.
 ```{r, message=FALSE, warning=FALSE, eval = FALSE}
-# vis <- FindVariableFeatures(vis, selection.method = "vst", nfeatures = 3000)
 vis <- RunPCA(vis, npcs = 50, assay = "SCT", verbose = FALSE)
 vis <- RunUMAP(vis, reduction = "pca", dims = 1:50)
 vis <- FindNeighbors(vis, reduction = "pca", dims = 1:50)

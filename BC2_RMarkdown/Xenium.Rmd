@@ -51,7 +51,7 @@ source("utils_new.R")
 # Xenium Analysis
 
 ## Read in Xenium
-In the Seurat Xenium tutorial, subcelluar transcripts and cell segmentation boundaries are loaded with the function Seurat::LoadXenium(). For the purpose of this tutorial, we will not dive deep into cell-segmentation, an ongoing research topic in the field of machine learning and medical imaging. We instead focus on exploring the concordance and integration between Chromium, Visium, and Xenium. Therefore, cellular-level resolution of Xenium is enough with the following approach.
+In the Seurat Xenium tutorial, subcellular transcripts and cell segmentation boundaries are loaded with the function Seurat::LoadXenium(). For the purpose of this tutorial, we will not dive deep into cell-segmentation, an ongoing research topic in the field of machine learning and medical imaging. We instead focus on exploring the concordance and integration between Chromium, Visium, and Xenium. Therefore, cellular-level resolution of Xenium is enough with the following approach.
 
 Read in Xenium as Seurat object with assay name as `"Xenium"`. We keep only relevant metadata columns. Unlike Visium, the spatial coordinates are stored in `xe@images$fov@boundaries$centroids@coords` in the Seurat object, which can be obtained by `GetTissueCoordinates()`. 
 ```{r, message=FALSE, warning=FALSE, eval = FALSE}
@@ -104,7 +104,7 @@ if(any(xe_mito_drop)){
 ```
 
 ### Per-gene QC
-Check if there are any low abundance gene with mean gene expression lower than exp(-5).
+Check if there is any low abundance gene with mean gene expression lower than exp(-5).
 ```{r, fig.width=5, fig.height=4}
 xe_lowgenecount_drop <- unlist(xe[[names(xe@assays)[1]]][["lowgenecount_drop"]])
 
@@ -125,16 +125,16 @@ dim(xe)           #  313 167780 -> 305 162219
 
 # Xenium analysis
 ## Xenium normalization
-Normalization with SCTransform
+Normalization with SCTransform. `SCTransform()` replaces the `NormalizeData()`, `ScaleData()`, and `FindVariableFeatures()` steps, with default number of variable features as 3000. However, since Xenium has very few genes (313 in the original data and 305 after QC), `FindVariableFeatures()` takes all of the features (305 genes) if the total number of genes available is less than 3000. 
 ```{r, eval = FALSE}
 xe <- readRDS("./intermediate_data/xe_qcd.rds")
 xe <- SCTransform(xe, assay = "Xenium")
 ```
 
 ## Xenium dimension reduction and clustering
-Since Xenium has very few genes (313 in the original data and 305 after QC), we will skip the step of finding highly variable genes, and run PCA on all 305 genes with 50 PCs. This steps takes in total around 8 minutes to run.
+We perform the following steps on the SCTransform normalized Xenium data. These steps take in total around 8 minutes to run.
 ```{r, message=FALSE, eval = FALSE}
-xe <- RunPCA(xe, npcs = 50, assay = "SCT", features = rownames(xe))
+xe <- RunPCA(xe, npcs = 50, assay = "SCT")
 xe <- FindNeighbors(xe, reduction = "pca", dims = 1:50)
 xe <- FindClusters(xe, verbose = FALSE)
 xe <- RunUMAP(xe, dims = 1:50)
@@ -172,7 +172,7 @@ patchwork::wrap_plots(feat.plots, ncol=3)
 
 ```
 
-Here you can modify the code for finding spatially variable genes in Visium and adapt it to Xenium. This step would take extra long to run due to the huge data size of Xenium, so it is recommended to run it on HPC and saved the intermediate object. For the sake of time, we will skip this step for Xenium. 
+Here you can modify the code for finding spatially variable genes in Visium and adapt it to Xenium. This step would take extra long to run due to the huge data size of Xenium, so it is recommended to run it on HPC and save the intermediate object. For the sake of time, we will skip this step for Xenium. 
 
 ### Visualize Seurat clustering result
 Visualize UMAP of Xenium, colored by clustering with Seurat. SpatialDimPlot() cannot be directly used here with `SlideSeq` class, so we use our own helper functions `extractCol()` to extract the color of DimPlot and ensure the same palette is used for `SpatialFeaturePlot_cate()`. 
