@@ -16,12 +16,15 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Load libraries
 
-```{r lib, warning=FALSE}
+```{r lib, warning=FALSE, message=FALSE}
 root_path <- "~/Desktop/raw_data_must/"
 chrom_path <- paste0(root_path, "Chromium/")
 vis_path <- paste0(root_path, "Visium/outs/")
 xe_path <- paste0(root_path, "Xenium/outs/")
 aggxe_path <- paste0(root_path, "AggXe/outs/")
+
+# devtools::install_github("estellad/SeuratQCUtils")
+# devtools::install_github("estellad/plotOnUMAP")
 
 suppressMessages({
   library(Seurat)
@@ -43,9 +46,8 @@ suppressMessages({
   library(knitr)
   library(here)
   library(cowplot)
+  library(SeuratQCUtils)
 })
-
-source("utils_new.R")
 ```
 
 
@@ -89,8 +91,8 @@ chrom <- readRDS("./intermediate_data/chrom_raw.rds")
 chrom$percent.mt <- PercentageFeatureSet(chrom, pattern = "^MT-")
 chrom$discard <- ifelse(chrom$Annotation == "discard", TRUE, FALSE)
 
-p1 <- plot_Hist_Low_Lib_Sizes(chrom, yvar = "discard")
-p2 <- plot_Hist_High_Mito_Props(chrom, yvar = "discard")
+p1 <- SeuratQCUtils::plot_Hist_Low_Lib_Sizes(chrom, yvar = "discard")
+p2 <- SeuratQCUtils::plot_Hist_High_Mito_Props(chrom, yvar = "discard")
 
 (p1 + p2) + plot_annotation("Chromium QC - Per Cell")
 ```
@@ -99,11 +101,11 @@ p2 <- plot_Hist_High_Mito_Props(chrom, yvar = "discard")
 For QC on genes, we exclude low abundance genes with mean expression level lower than exp(-5) \approx 0.0067. 
 ```{r, warning=FALSE, fig.width=4, fig.height=3.5}
 # Add per gene QC metrics
-chrom <- addQCMetricsPerGene_seu(chrom)
+chrom <- SeuratQCUtils::addQCMetricsPerGene_seu(chrom)
 chrom_lowgenecount_drop <- unlist(chrom[["RNA"]][["lowgenecount_drop"]])
 
 if(any(chrom_lowgenecount_drop)){
-  p3 <- plot_Hist_Low_Abun_Genes(chrom)
+  p3 <- SeuratQCUtils::plot_Hist_Low_Abun_Genes(chrom)
 }
 
 p3 + plot_annotation("Chromium QC - Per Gene")
@@ -124,7 +126,7 @@ dim(chrom) # 13969 27460
 ## Chromium cell-type proportion
 Now the QCed Chromium data is ready for constructing RCTD reference object in the following section. We first visualize available cell-type proportion in the Chromium dataset.
 ```{r, warning = FALSE, fig.width=6, fig.height=4}
-plotBar_seu(chrom, decreasing = TRUE, title = "Cell-type Frequency in Annotated Chromium")
+SeuratQCUtils::plotBar_seu(chrom, decreasing = TRUE, title = "Cell-type Frequency in Annotated Chromium")
 ```
 
 Now we proceed to the analysis of Visium and also preparing for the spatial object required for cell-type deconvolution. 

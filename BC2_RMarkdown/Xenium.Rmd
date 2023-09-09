@@ -16,12 +16,15 @@ knitr::opts_chunk$set(echo = TRUE)
 
 # Load libraries
 
-```{r lib, warning=FALSE}
+```{r lib, warning=FALSE, message=FALSE}
 root_path <- "~/Desktop/raw_data_must/"
 chrom_path <- paste0(root_path, "Chromium/")
 vis_path <- paste0(root_path, "Visium/outs/")
 xe_path <- paste0(root_path, "Xenium/outs/")
 aggxe_path <- paste0(root_path, "AggXe/outs/")
+
+# devtools::install_github("estellad/SeuratQCUtils")
+# devtools::install_github("estellad/plotOnUMAP")
 
 suppressMessages({
   library(Seurat)
@@ -43,9 +46,8 @@ suppressMessages({
   library(knitr)
   library(here)
   library(cowplot)
+  library(SeuratQCUtils)
 })
-
-source("utils_new.R")
 ```
 
 # Xenium Analysis
