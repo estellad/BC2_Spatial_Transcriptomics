@@ -1,6 +1,9 @@
 # History files
 .Rhistory
 .Rapp.history
+.DS_Store
+intermediate_data/
+BC2_RMarkdown/Xenium_files/
 
 # Session Data files
 .RData
