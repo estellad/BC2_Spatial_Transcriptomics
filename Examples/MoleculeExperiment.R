@@ -1,4 +1,5 @@
 # BiocManager::install("MoleculeExperiment")
+devtools::install_github("SydneyBioX/MoleculeExperiment")
 # Read in Xenium
 library(MoleculeExperiment)
 library(ggplot2)
