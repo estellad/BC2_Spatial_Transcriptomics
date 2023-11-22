@@ -1,0 +1,340 @@
+---
+title: "BC2 Spatial Transcriptomics Tutorial"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: 
+      collapsed: false
+date: '`r format(Sys.Date(), "%d %B, %Y")`'
+author: Estella Yixing Dong
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+
+```{r lib, warning=FALSE, message=FALSE}
+root_path <- "~/Desktop/raw_data_must/"
+chrom_path <- paste0(root_path, "Chromium/")
+vis_path <- paste0(root_path, "Visium/outs/")
+xe_path <- paste0(root_path, "Xenium/outs/")
+aggxe_path <- paste0(root_path, "AggXe/outs/")
+
+# suppressMessages({
+#   devtools::install_github("estellad/SeuratQCUtils")
+#   devtools::install_github("estellad/plotOnUMAP")
+# })
+
+suppressMessages({
+  library(Seurat)
+  library(BayesSpace)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tibble)
+  library(scater)
+  library(scran)
+  library(scuttle)
+  library(grid)
+  library(hrbrthemes)
+  library(gridExtra)
+  library(SingleR)
+  library(magick)
+  library(harmony)
+  library(scales)
+  library(knitr)
+  library(here)
+  library(cowplot)
+  library(SeuratQCUtils)
+})
+
+devtools::install_github("estellad/ggspavis", ref = "estellad")
+library(ggspavis)
+```
+
+
+# Visium analysis
+
+## Read in Visium
+Read in Visium as a `SpatialExperiment` object, and spatially visualize the per spot total count. Here we show one plot of spots overlaying the corresponding H&E image and the other plot of just Visium spots. 
+```{r, fig.width=10, fig.height=4.5}
+library(SpatialExperiment)
+vis_path <- paste0(root_path, "Visium/outs/")
+
+vis <- SpatialExperiment::read10xVisium(vis_path)
+vis$sample_id <- " "
+vis$libsize <- colSums(counts(vis))
+
+p1 <- ggspavis::plotVisium(vis, annotate = "libsize") +
+  guides(fill = guide_colorbar(barwidth = 1.2, barheight = 6.2))
+p2 <- ggspavis::plotSpots(vis, annotate = "libsize", size = 0.2)
+
+layout <- c(
+  area(t = 1, l = 1, b = 6, r = 3),
+  area(t = 2, l = 4, b = 5, r = 5.5)
+)
+
+p1 + p2 + 
+  plot_layout(design = layout)
+```
+
+## Visium QC
+QC Visium with the guidance from OSTA book. Library size (`sum` in OSTA book, `nCount_Spatial` in Seurat), number of features detected (`detected` in OSTA book, `nFeature_Spatial` in Seurat), mitochondria percentage, and number of cells per spot need to be checked. However, in this breast cancer data, no ground truth of number of cells per spot is given like in the Human DLPFC data in `spatialLIBD`. Therefore, we skip the last criteria, and focusing on the first three.  
+
+Investigate the proper cut-off threshold. Note that Visium is not at single cell resolution, so the automated QC functionality developed for single-cell RNA-seq, such as `scuttle::isOutlier()`, should be carefully double-checked to prevent falsely removal of spots in spatial data. 
+
+Here we have a quick view of the distribution of the three variables of interest. We want to eliminate spots with low total library size, and low number of features detected per spot, and high mitochondria.
+```{r}
+# Prepare mitochondria percentage 
+vis$percent.mt <- PercentageFeatureSet(vis, pattern = "^MT-")
+VlnPlot(vis, features = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"), pt.size = 0.1)
+```
+
+### Per-spot QC
+Check the lower end of `nCount_Spatial`, and set the threshold at 100 to visualize the effect of QC in `plotQCSpatial_seu()`. However, note that the removal is not necessary. 
+```{r}
+head(sort(vis$nCount_Spatial), 20)
+table(isOutlier(vis$nCount_Spatial, type = "lower"))
+```
+
+Check the lower end of `nFeature_Spatial`, and set the threshold also at 100.
+```{r}
+head(sort(vis$nFeature_Spatial), 20)
+table(isOutlier(vis$nFeature_Spatial, type = "lower"))
+```
+Check the higher end of `percent.mt`, and no spot has unusually high mitochondria percentage. 
+```{r}
+tail(sort(vis$percent.mt), 20)
+```
+
+Plot QC result. The helper function here is inspired by the Bioconductor function ggspavis::plotQC(spe), and here `plotQCSpatial_seu()` takes a Seurat object with "Spatial" assay and has spatial coordinates stored in its metadata. 
+```{r}
+vis$low_count_spots <- vis$nCount_Spatial < 100 | vis$nFeature_Spatial < 100
+plotQCSpatial_seu(vis, flag = "low_count_spots")
+```
+
+### Per-gene QC
+Deriving low abundance gene flag. For genes, we require it to be detected in at least 20 spots. 66 genes will be removed. 
+```{r}
+vis_lowgenecount_drop <- rowSums(GetAssayData(vis, "counts") > 0) < 20
+table(vis_lowgenecount_drop)
+```
+
+### Post QC subsetting
+Eliminate genes and spots did not pass QC:
+```{r, message=FALSE}
+vis <- vis[!vis_lowgenecount_drop,  # low abundance genes
+             !vis$low_count_spots ]     # low library size & number of detected genes per spot
+
+dim(vis) # 18019  4988
+# saveRDS(vis, "./intermediate_data/vis_qcd.rds")
+```
+
+## Visium normalization
+Normalization with SCTransform, as recommended by Seurat framework. `SCTransform()` replaces the `NormalizeData()`, `ScaleData()`, and `FindVariableFeatures()` steps, with default number of variable features as 3000.
+```{r, eval = FALSE}
+# vis <- readRDS("./intermediate_data/vis_qcd.rds")
+vis <- SCTransform(vis, assay = "Spatial", verbose = FALSE)
+```
+
+## Visium dimension reduction and clustering
+Dimensionality reduction and clustering with Seurat.
+```{r, message=FALSE, warning=FALSE, eval = FALSE}
+vis <- RunPCA(vis, npcs = 50, assay = "SCT", verbose = FALSE)
+vis <- RunUMAP(vis, reduction = "pca", dims = 1:50)
+vis <- FindNeighbors(vis, reduction = "pca", dims = 1:50)
+vis <- FindClusters(vis, verbose = FALSE)
+
+# saveRDS(vis, "./intermediate_data/vis_qcd_dimred.rds")
+```
+
+### Visium spatially variable genes
+Spatially variable genes (SVGs) identification based on spatial autocorrelation "Moran's I" index. This step takes a long time to run, so for the sake of time, it is recommended to directly load in the intermediate data. 
+```{r, eval = FALSE}
+vis <- readRDS("./intermediate_data/vis_qcd_dimred.rds")
+# DO NOT RUN - TAKING TOO LONG
+vis <- FindSpatiallyVariableFeatures(vis, assay = "SCT", features = VariableFeatures(vis), selection.method = "moransi")
+
+vis_SVGs_6 = rownames(
+  dplyr::slice_min(
+    vis[["SCT"]]@meta.features,
+    moransi.spatially.variable.rank,
+    n = 6
+  )
+)
+```
+
+Visualize top 6 Visium SVGs in UMAP space. 
+```{r, warning=FALSE, fig.width=10, fig.height=6}
+vis <- readRDS("./intermediate_data/vis_qcd_dimred.rds")
+vis_SVGs_6 = c("DCAF7", "MT-ND1", "CSDE1", "TACO1", "MIEN1", "NRAS")
+FeaturePlot(vis, features = vis_SVGs_6, ncol = 3, raster = FALSE)
+```
+
+Visualize top 6 Visium SVGs spatially. Combining results from deconvolution, we can see that genes highly expressed in invasive tumor region has high spatial variability.
+```{r, warning=FALSE, fig.width=10, fig.height=6}
+markers <- vis_SVGs_6
+feat.plots <- purrr::map(markers, function(x) SpatialFeaturePlot(vis, x))
+patchwork::wrap_plots(feat.plots, ncol=3)
+
+```
+
+### Visualize Seurat clustering result
+Visium UMAP clustering colored by Seurat
+```{r, message=FALSE, fig.width=10, fig.height=5}
+vis <- readRDS("./intermediate_data/vis_qcd_dimred.rds")
+p1 <- DimPlot(vis) + ggtitle("Colored by Seurat Clustering")
+p2 <- SpatialDimPlot(vis, label = TRUE, label.size = 3)
+p1 + p2
+```
+Combining the information from deconvolution result later, we would realize that cluster 1 is likely invasive tumor. 
+
+
+### Visium spatial clustering with BayesSpace
+Spatial clustering with BayesSpace. First, we convert the Visium Seurat object to SingleCellExperiment object as required by BayesSpace.
+
+We carry over everything we have calculated so far for Visium, except the spatial coordinates. Seurat::Load10X_Spatial() does not keep all the spatial columns required for BayesSpace (e.g. enhanced version), and it also changes the scaling of the tissue coordinates to match with H&E image, which is incompatible with BayesSpace. Instead of using SeuratObject::GetTissueCoordinates(vis), we read in the original spatial coordinates, with the following modification. 
+```{r, message=FALSE}
+# First, convert Visium Seurat object to SCE required by BayesSpace
+vis_mat <- vis@assays$Spatial@counts
+vis_sct <- vis@assays$SCT@counts
+
+vis_pca <- vis@reductions$pca@cell.embeddings
+vis_umap <- vis@reductions$umap@cell.embeddings
+
+# Merge in spatial coordinates from original tissue_position.csv.
+vis_coord <- read.csv(paste0(vis_path, "spatial/tissue_positions_list.csv"), header = FALSE)
+colnames(vis_coord) <- c("barcodes", "in_tissue", "row", "col", "pxl_row_in_fullres", "pxl_col_in_fullres")
+
+vis_meta <- vis@meta.data
+vis_meta$barcodes <- rownames(vis_meta)
+
+vis_CD <- vis_meta %>%
+  left_join(vis_coord)
+
+vis_sce <- SingleCellExperiment(assays = list(counts = vis_mat, 
+                                              SCTcounts = vis_sct), 
+                                reducedDims = SimpleList(PCA = vis_pca, UMAP = vis_umap),
+                                colData = vis_CD)
+
+# saveRDS(vis_sce, "./intermediate_data/vis_qcd_dimred_sce.rds")
+```
+
+
+We assign the same number of clusters to BayesSpace identified by Seurat (n.cluster = 18), since we also get the confirmation of a similar number of cluster from Chromium (n.cluster = 19, see `Chromium.Rmd` and the `Visium deconvolution` section in this Markdown).  This step takes a long time to run, so it's recommended to run on HPC, and save the results. 
+```{r, eval = FALSE, message=FALSE}
+# Just FYI, there is also a speed-up version of the original Bioconductor R package BayesSpace from GitHub, for the enhanced resolution of BayesSpace (which we won't cover in this tutorial)
+# devtools::install_github(senbaikang/BayesSpace)
+library(BayesSpace)
+
+vis_sce <- readRDS("./intermediate_data/vis_qcd_dimred_sce.rds")
+
+# DO NOT RUN - TAKING TOO LONG
+# We assign the same number of clusters to BayesSpace identified by Seurat
+vis_sce <- vis_sce %>% 
+        spatialCluster(q = 18, use.dimred = "PCA", platform = "Visium", nrep = 10000)
+
+# saveRDS(vis_sce, "./intermediate_data/vis_qcd_dimred_sce_bayesspace.rds")
+```
+
+Save Visium BayesSpace clustering result back to Visium Seurat object for plotting
+```{r}
+vis <- readRDS("./intermediate_data/vis_qcd_dimred.rds")
+vis_sce <- readRDS("./intermediate_data/vis_qcd_dimred_sce_bayesspace.rds")
+
+vis[["spatial.cluster"]] <- vis_sce$spatial.cluster
+```
+
+### Visium BayesSpace spatial clustering result 
+Visualize UMAP and spatial plot of Visium, colored by clustering with Seurat and BayesSpace. 
+```{r, message=FALSE, fig.width=10, fig.height=5}
+p3 <- DimPlot(vis, group.by = "spatial.cluster") + ggtitle("Colored by BayesSpace spatial clustering")
+p4 <- SpatialDimPlot(vis, group.by = "spatial.cluster", label = TRUE, label.size = 3)
+p3 + p4
+```
+We can see that BayesSpace recovers the structure of DCIS 2 (cluster 1) better compared to Seurat clustering, which does not take into account the spatial coordinate information.  
+
+From here on, you can perform differential expression analysis between the clusters. 
+
+# Visium cell-type deconvolution with Chromium reference 
+## Build reference and spatialRNA objects
+```{r}
+library(spacexr)
+chrom <- readRDS("./intermediate_data/chrom_raw.rds")
+
+# Reference Chromium, unnormalized counts
+chrom_mat <- GetAssayData(chrom, slot = "counts")
+cell_types <- as.factor(chrom$Annotation); names(cell_types) <- colnames(chrom)
+
+ref <- Reference(chrom_mat, cell_types)
+
+# Visium to be deconvolved, unnormalized counts
+coords <- GetTissueCoordinates(vis)
+counts <- GetAssayData(vis, slot = "counts")
+
+puck <- SpatialRNA(coords, counts)
+```
+
+## Run RCTD
+We specify "full" mode here to indicate there can be many cells in a spot, and save RCTD results. 
+```{r, warning=FALSE, eval = FALSE}
+# DO NOT RUN - TAKING TOO LONG
+myRCTD <- create.RCTD(puck, ref, max_cores = 4)
+myRCTD <- run.RCTD(myRCTD, doublet_mode = 'full')
+# saveRDS(myRCTD, "./intermediate_data/vis_RCTD.rds")
+```
+
+Organize cell-type deconvolution results, the weights should be normalized so the proportion of each cell type in a spot sums up to 1.
+```{r}
+myRCTD <- readRDS("./intermediate_data/vis_RCTD.rds")
+results <- myRCTD@results
+norm_weights <- normalize_weights(results$weights)
+cell_type_names <- myRCTD@cell_type_info$info[[2]]
+spatialRNA <- myRCTD@spatialRNA
+barcodes <- colnames(myRCTD@spatialRNA@counts)
+```
+
+## Plot cell-type deconvolution
+Plot cell-type deconvolution result. We first check the deconvolution result for one cell-type. Here we set the intensity range based on the probability score range of this cell-type across all spots. 
+```{r, message=FALSE, fig.width=5, fig.height=4.5}
+# range(norm_weights[, cell_type_names[1]])
+# 1.072845e-05 3.576271e-01
+
+plot_puck_continuous(spatialRNA, barcodes, norm_weights[, cell_type_names[1]], title = cell_type_names[1], ylimit = c(0, 0.4), size = 0.8) + coord_flip() + scale_x_reverse()
+
+```
+
+We then separate the remaining cell types into two batches for the sake of clarity in visualization. All these plots have the color scale intensity ranging from 0 to 1. (Note the plot is stretched horizontally in the below limited plotting space, but the orientation matches the H&E spatial feature plot of Visium.) 
+```{r, message=FALSE, fig.width=10, fig.height=11}
+p <- list()
+for (i in 2:10){
+  which_cell_type <- cell_type_names[i]
+  p[[i-1]] <- plot_puck_continuous(spatialRNA, barcodes, norm_weights[, which_cell_type], title = which_cell_type) + coord_flip() + scale_x_reverse() + theme(legend.position = "none")
+}
+do.call(grid.arrange, p)
+```
+
+
+```{r, message=FALSE, fig.width=10, fig.height=11}
+p <- list()
+for (i in 11:19){
+  which_cell_type <- cell_type_names[i]
+  p[[i-10]] <- plot_puck_continuous(spatialRNA, barcodes, norm_weights[, which_cell_type], title = which_cell_type) + coord_flip() + scale_x_reverse() + theme(legend.position = "none")
+}
+do.call(grid.arrange, p)
+```
+
+In addition, you can save the plots with the commented code. 
+```{r}
+## Create a local directory for saved plots
+# RCTD_result_path <- "./results/"
+# for (i in 1:length(cell_type_names)){
+#   which_cell_type <- cell_type_names[i]
+#   plot_puck_continuous(puck, barcodes, norm_weights[, which_cell_type], title = which_cell_type) + coord_flip() + 
+#     scale_x_reverse()
+#   ggsave(path = RCTD_result_path, filename = paste0(which_cell_type, ".png"))
+# }
+```
