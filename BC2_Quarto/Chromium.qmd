@@ -1,0 +1,132 @@
+---
+title: "BC2 Spatial Transcriptomics Tutorial"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: 
+      collapsed: false
+date: '`r format(Sys.Date(), "%d %B, %Y")`'
+author: Estella Yixing Dong
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+
+```{r lib, warning=FALSE, message=FALSE}
+root_path <- "~/Desktop/raw_data_must/"
+chrom_path <- paste0(root_path, "Chromium/")
+vis_path <- paste0(root_path, "Visium/outs/")
+xe_path <- paste0(root_path, "Xenium/outs/")
+aggxe_path <- paste0(root_path, "AggXe/outs/")
+
+# devtools::install_github("estellad/SeuratQCUtils")
+# devtools::install_github("estellad/plotOnUMAP")
+
+suppressMessages({
+  library(Seurat)
+  library(BayesSpace)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tibble)
+  library(scater)
+  library(scran)
+  library(scuttle)
+  library(grid)
+  library(hrbrthemes)
+  library(gridExtra)
+  library(SingleR)
+  library(magick)
+  library(harmony)
+  library(scales)
+  library(knitr)
+  library(here)
+  library(cowplot)
+  library(SeuratQCUtils)
+})
+```
+
+
+# Chromium analysis 
+
+## Read in Chromium
+Read in Chromium as Seurat object, and we store its annotation in the metadata. The Chromium annotation is derived by 10x using marker genes and cell atlas reference. Since a round of QC on cells was done by 10x before annotating the Chromium, we avoid repetitive QC on cells. 
+Cell barcodes that are in count matrix but not in the annotation file is QCed out. 
+```{r, results = "hide", message=FALSE, eval = FALSE}
+chrom_path <- paste0(root_path, "Chromium/")
+Counts <- Seurat::Read10X_h5(paste0(chrom_path, "filtered_feature_bc_matrix.h5")) 
+# dim(Counts)                       # 18082 30365  gene * cells barcodes
+
+Anno <- read.csv(paste0(chrom_path, "chrom_cell_annotations.csv")) 
+rownames(Anno) <- Anno$Barcode 
+# dim(Anno)                         # 27472 cell barcodes
+
+overlap_cell_barcode <- intersect(colnames(Counts), rownames(Anno)) 
+# length(overlap_cell_barcode)      # 27460 cell barcodes that passed QC by 10x
+
+# Create flag discard for cells that are QCed out
+Anno_ <- data.frame(Barcode = colnames(Counts)) %>%
+  left_join(Anno) %>%
+  mutate(Annotation = ifelse(is.na(Annotation), "discard", Annotation))
+rownames(Anno_) <- Anno_$Barcode
+
+chrom <- CreateSeuratObject(counts = Counts, meta.data = Anno_) 
+# dim(chrom)                        # 18082 30365
+
+# saveRDS(chrom, "./intermediate_data/chrom_raw.rds")
+rm(Counts, Anno_, Anno); gc()
+```
+
+## Chromium QC
+### Per-cell QC
+The reason of discard could be low library size or high mitochondria percentage. Here we visualize the discarded cells on the histogram of library size and mitochondria percentage, both on log scale. 
+```{r, warning=FALSE, fig.width=12}
+chrom <- readRDS("./intermediate_data/chrom_raw.rds")
+
+# Add per cell QC metrics
+chrom$percent.mt <- PercentageFeatureSet(chrom, pattern = "^MT-")
+chrom$discard <- ifelse(chrom$Annotation == "discard", TRUE, FALSE)
+
+p1 <- SeuratQCUtils::plot_Hist_Low_Lib_Sizes(chrom, yvar = "discard")
+p2 <- SeuratQCUtils::plot_Hist_High_Mito_Props(chrom, yvar = "discard")
+
+(p1 + p2) + plot_annotation("Chromium QC - Per Cell")
+```
+
+### Per-gene QC
+For QC on genes, we exclude low abundance genes with mean expression level lower than exp(-5) \approx 0.0067. 
+```{r, warning=FALSE, fig.width=4, fig.height=3.5}
+# Add per gene QC metrics
+chrom <- SeuratQCUtils::addQCMetricsPerGene_seu(chrom)
+chrom_lowgenecount_drop <- unlist(chrom[["RNA"]][["lowgenecount_drop"]])
+
+if(any(chrom_lowgenecount_drop)){
+  p3 <- SeuratQCUtils::plot_Hist_Low_Abun_Genes(chrom)
+}
+
+p3 + plot_annotation("Chromium QC - Per Gene")
+```
+
+### Post QC subsetting 
+For the sake of time, we could directly load in the saved raw Chromium data in the next chunk. We now subset to cells that have successfully past QC, and save the Chromium reference that is ready for cell-type deconvolution with RCTD. 
+```{r}
+# Subset
+chrom <- chrom[!chrom_lowgenecount_drop, !chrom$discard]
+
+dim(chrom) # 13969 27460
+# saveRDS(chrom, "./intermediate_data/chrom_qcd.rds")
+
+## Ready for RCTD :D
+```
+
+## Chromium cell-type proportion
+Now the QCed Chromium data is ready for constructing RCTD reference object in the following section. We first visualize available cell-type proportion in the Chromium dataset.
+```{r, warning = FALSE, fig.width=6, fig.height=4}
+SeuratQCUtils::plotBar_seu(chrom, decreasing = TRUE, title = "Cell-type Frequency in Annotated Chromium")
+```
+
+Now we proceed to the analysis of Visium and also preparing for the spatial object required for cell-type deconvolution. 
